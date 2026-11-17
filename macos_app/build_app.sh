@@ -14,11 +14,54 @@ TARGET="${ARCH}-apple-macosx14.0"
 
 echo "==> Building PDF Scanner.app ($TARGET)..."
 rm -rf "$REPO_ROOT/CamScanner.app" "$APP_DIR"
-mkdir -p "$MACOS_DIR" "$RESOURCES_DIR/scripts"
+mkdir -p "$MACOS_DIR" "$RESOURCES_DIR/scripts" "$RESOURCES_DIR/bin"
 
-# Bundle scanner scripts so the app runs standalone when installed via DMG
+# Bundle scanner scripts + precompiled Vision binary so the app runs standalone when installed via DMG
 cp "$REPO_ROOT/scripts/batch_scanner.py" "$RESOURCES_DIR/scripts/batch_scanner.py"
+cp "$REPO_ROOT/scripts/pdf_compressor.py" "$RESOURCES_DIR/scripts/pdf_compressor.py"
 cp "$REPO_ROOT/scripts/doc_scanner.swift" "$RESOURCES_DIR/scripts/doc_scanner.swift"
+
+echo "==> Precompiling Vision helper (doc_scanner)..."
+swiftc -O \
+  -target "$TARGET" \
+  -framework Foundation \
+  -framework CoreImage \
+  -framework CoreGraphics \
+  -framework ImageIO \
+  -framework Vision \
+  "$REPO_ROOT/scripts/doc_scanner.swift" \
+  -o "$RESOURCES_DIR/bin/doc_scanner"
+
+# Bundle standalone Python runtime + .venv site-packages if .venv is present
+VENV_PY="$REPO_ROOT/.venv/bin/python"
+if [[ -x "$VENV_PY" ]]; then
+  echo "==> Bundling relocatable Python runtime & dependencies..."
+  "$VENV_PY" - "$RESOURCES_DIR/python_runtime" << 'PY_BUNDLE'
+import os, pathlib, shutil, site, sys
+
+dest = pathlib.Path(sys.argv[1])
+base_prefix = pathlib.Path(sys.base_prefix)
+site_pkgs = next((pathlib.Path(p) for p in site.getsitepackages() if p.endswith("site-packages") and os.path.isdir(p)), None)
+ver_dir = f"python{sys.version_info.major}.{sys.version_info.minor}"
+py_bin = pathlib.Path(os.path.realpath(sys.executable))
+
+(dest / "bin").mkdir(parents=True, exist_ok=True)
+(dest / "lib").mkdir(parents=True, exist_ok=True)
+shutil.copy2(py_bin, dest / "bin" / ver_dir)
+os.chmod(dest / "bin" / ver_dir, 0o755)
+shutil.copytree(
+    base_prefix / "lib" / ver_dir,
+    dest / "lib" / ver_dir,
+    ignore=shutil.ignore_patterns("__pycache__", "test", "tkinter", "idlelib", "turtledemo", "ensurepip"),
+)
+if site_pkgs is not None:
+    shutil.copytree(
+        site_pkgs,
+        dest / "site-packages",
+        ignore=shutil.ignore_patterns("__pycache__", "*.dist-info"),
+    )
+PY_BUNDLE
+fi
 
 # 1. Generate Info.plist
 cat > "$CONTENTS_DIR/Info.plist" << 'PLIST'
@@ -43,9 +86,9 @@ cat > "$CONTENTS_DIR/Info.plist" << 'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>1.1.0</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>2</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>
@@ -71,7 +114,7 @@ cat > "$CONTENTS_DIR/Info.plist" << 'PLIST'
 PLIST
 
 # 2. Generate AppIcon.icns using CoreGraphics + iconutil
-ICON_TMP="$(mktemp -d /tmp/camscanner_icon.XXXXXX)"
+ICON_TMP="$(mktemp -d /tmp/pdfscanner_icon.XXXXXX)"
 trap 'rm -rf "$ICON_TMP"' EXIT
 ICONSET_DIR="$ICON_TMP/AppIcon.iconset"
 mkdir -p "$ICONSET_DIR"
@@ -172,20 +215,34 @@ SWIFT_ICON
 
 iconutil -c icns "$ICONSET_DIR" -o "$RESOURCES_DIR/AppIcon.icns"
 
-# 3. Compile Swift sources
+# 3. Compile Swift sources (including subdirectories under Sources/)
+SWIFT_SOURCES=()
+while IFS= read -r src_file; do
+  SWIFT_SOURCES+=("$src_file")
+done < <(find "$SRC_DIR" -type f -name "*.swift" | sort)
+
 swiftc -O -swift-version 5 -parse-as-library \
   -target "$TARGET" \
   -framework SwiftUI \
   -framework AppKit \
+  -framework CoreText \
   -framework PDFKit \
   -framework Vision \
   -framework CoreImage \
   -framework UniformTypeIdentifiers \
-  "$SRC_DIR"/*.swift \
+  "${SWIFT_SOURCES[@]}" \
   -o "$MACOS_DIR/PDFScanner"
 
-# 4. Ad-hoc codesign
+# 4. Ad-hoc codesign (sign bundled Mach-O executables/extensions before bundle sign)
+if [[ -d "$RESOURCES_DIR/python_runtime" ]]; then
+  while IFS= read -r macho; do
+    codesign --force --sign - "$macho" >/dev/null 2>&1 || true
+  done < <(find "$RESOURCES_DIR/python_runtime" -type f \( -name "*.so" -o -name "*.dylib" \))
+  codesign --force --sign - "$RESOURCES_DIR/python_runtime/bin"/python* >/dev/null 2>&1 || true
+fi
+codesign --force --sign - "$RESOURCES_DIR/bin/doc_scanner"
 codesign --force --deep --sign - "$APP_DIR"
+codesign --verify --deep --strict "$APP_DIR"
 
 echo "==> Successfully built: $APP_DIR"
 ls -lh "$MACOS_DIR/PDFScanner"

@@ -1,10 +1,12 @@
 import Foundation
+import PDFKit
 
 enum ScannerBridgeError: LocalizedError {
     case workspaceNotFound
     case scriptNotFound(String)
     case processFailed(Int32, String)
     case noPreviewGenerated
+    case pageProcessingFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -16,8 +18,36 @@ enum ScannerBridgeError: LocalizedError {
             return "Tiến trình thất bại (mã \(code)): \(details)"
         case .noPreviewGenerated:
             return "Pipeline hoàn tất nhưng không tạo được ảnh xem trước."
+        case .pageProcessingFailed(let details):
+            return details
         }
     }
+}
+
+struct ManifestPageResult: Decodable {
+    let index: Int
+    let input: String
+    let file: String?
+    let status: String
+    let output: String?
+    let message: String?
+    let method: String?
+    let confidence: Double?
+    let width: Int?
+    let height: Int?
+}
+
+struct PipelineManifest: Decodable {
+    let engine: String?
+    let output: String?
+    let pages: Int?
+    let pages_error: Int?
+    let results: [ManifestPageResult]
+}
+
+struct BatchScanResult {
+    let resolvedURLs: [UUID: URL]
+    let errors: [UUID: String]
 }
 
 private final class LinePipeAccumulator: @unchecked Sendable {
@@ -59,23 +89,360 @@ private final class LinePipeAccumulator: @unchecked Sendable {
     }
 }
 
+private struct CompressorJSONReport: Decodable {
+    let before_bytes: Int64
+    let after_bytes: Int64
+    let pages: Int
+    let vector_pages: Int
+    let image_pages: Int
+    let recompressed_images: Int
+    let target_bytes: Int64
+    let target_achieved: Bool
+    let used_dpi: Int
+    let used_quality: Int
+    let message: String
+}
+
+private struct WorkerJobResponse: Decodable {
+    let id: String?
+    let status: String
+    let output: String?
+    let message: String?
+    let method: String?
+    let confidence: Double?
+    let width: Int?
+    let height: Int?
+}
+
+private final class PersistentPythonWorker: @unchecked Sendable {
+    private let pythonURL: URL
+    private let pythonFlags: [String]
+    private let scriptURL: URL
+    private let environment: [String: String]
+    private let workingDirectory: URL
+    private let serialQueue = DispatchQueue(label: "com.pdfscanner.app.pythonworker", qos: .userInitiated)
+    private let stateLock = NSLock()
+
+    private var process: Process?
+    private var stdinHandle: FileHandle?
+    private var stdoutHandle: FileHandle?
+    private var logHandler: ((String) -> Void)?
+
+    init(
+        pythonURL: URL,
+        pythonFlags: [String],
+        scriptURL: URL,
+        environment: [String: String],
+        workingDirectory: URL
+    ) {
+        self.pythonURL = pythonURL
+        self.pythonFlags = pythonFlags
+        self.scriptURL = scriptURL
+        self.environment = environment
+        self.workingDirectory = workingDirectory
+    }
+
+    deinit {
+        terminate()
+    }
+
+    func terminate() {
+        stateLock.lock()
+        let proc = process
+        process = nil
+        stdinHandle = nil
+        stdoutHandle = nil
+        logHandler = nil
+        stateLock.unlock()
+
+        if let proc, proc.isRunning {
+            proc.terminate()
+        }
+    }
+
+    private func ensureRunningLocked() throws {
+        if let proc = process, proc.isRunning, stdinHandle != nil, stdoutHandle != nil {
+            return
+        }
+
+        let proc = Process()
+        proc.executableURL = pythonURL
+        proc.arguments = pythonFlags + [scriptURL.path, "--worker-stdio"]
+        proc.environment = environment
+        proc.currentDirectoryURL = workingDirectory
+
+        let inPipe = Pipe()
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        proc.standardInput = inPipe
+        proc.standardOutput = outPipe
+        proc.standardError = errPipe
+
+        errPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            self?.stateLock.lock()
+            let sink = self?.logHandler
+            self?.stateLock.unlock()
+            for raw in text.components(separatedBy: "\n") {
+                let clean = raw.trimmingCharacters(in: .newlines)
+                if !clean.isEmpty {
+                    sink?(clean)
+                }
+            }
+        }
+
+        proc.terminationHandler = { [weak self] _ in
+            errPipe.fileHandleForReading.readabilityHandler = nil
+            self?.stateLock.lock()
+            if self?.process === proc {
+                self?.process = nil
+                self?.stdinHandle = nil
+                self?.stdoutHandle = nil
+            }
+            self?.stateLock.unlock()
+        }
+
+        try proc.run()
+        self.process = proc
+        self.stdinHandle = inPipe.fileHandleForWriting
+        self.stdoutHandle = outPipe.fileHandleForReading
+    }
+
+    private func readJSONLine(from handle: FileHandle) -> Data? {
+        var buffer = Data()
+        while true {
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                return buffer.isEmpty ? nil : buffer
+            }
+            if let nlRange = chunk.firstIndex(of: 0x0A) {
+                buffer.append(chunk[..<nlRange])
+                return buffer
+            }
+            buffer.append(chunk)
+        }
+    }
+
+    func runJob(
+        payload: [String: Any],
+        onLog: @escaping (String) -> Void
+    ) async throws -> WorkerJobResponse {
+        let reqData = try JSONSerialization.data(withJSONObject: payload, options: [])
+        var lineData = reqData
+        lineData.append(0x0A)
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                serialQueue.async { [weak self] in
+                    guard let self else {
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
+                    do {
+                        self.stateLock.lock()
+                        self.logHandler = onLog
+                        try self.ensureRunningLocked()
+                        guard let inH = self.stdinHandle, let outH = self.stdoutHandle else {
+                            self.stateLock.unlock()
+                            throw ScannerBridgeError.processFailed(-1, "Không khởi chạy được worker Python.")
+                        }
+                        self.stateLock.unlock()
+
+                        try inH.write(contentsOf: lineData)
+                        guard let respData = self.readJSONLine(from: outH) else {
+                            self.terminate()
+                            throw ScannerBridgeError.processFailed(-1, "Worker Python đóng kết nối đột ngột.")
+                        }
+                        let decoded = try JSONDecoder().decode(WorkerJobResponse.self, from: respData)
+                        continuation.resume(returning: decoded)
+                    } catch {
+                        self.terminate()
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        } onCancel: { [weak self] in
+            self?.terminate()
+        }
+    }
+}
+
 final class ScannerBridge {
     let workspaceRoot: URL
     let pythonURL: URL
+    let bundledPythonRoot: URL?
     let swiftURL: URL
     let batchScannerScript: URL
+    let pdfCompressorScript: URL
     let docScannerScript: URL
+    let precompiledDocScannerURL: URL?
 
     private var activeProcess: Process?
     private let processLock = NSLock()
+    private var persistentWorker: PersistentPythonWorker?
 
     init() throws {
         let root = try Self.discoverWorkspaceRoot()
         self.workspaceRoot = root
         self.batchScannerScript = root.appendingPathComponent("scripts/batch_scanner.py")
+        self.pdfCompressorScript = root.appendingPathComponent("scripts/pdf_compressor.py")
         self.docScannerScript = root.appendingPathComponent("scripts/doc_scanner.swift")
-        self.pythonURL = Self.discoverPython(root: root)
+        let pyResolved = Self.discoverPython(root: root)
+        self.pythonURL = pyResolved.pythonURL
+        self.bundledPythonRoot = pyResolved.bundledRoot
+        self.precompiledDocScannerURL = Self.discoverPrecompiledDocScanner(root: root)
         self.swiftURL = URL(fileURLWithPath: "/usr/bin/swift")
+    }
+
+    deinit {
+        persistentWorker?.terminate()
+        cancelActiveProcess()
+    }
+
+    var pythonIsolationFlags: [String] {
+        bundledPythonRoot != nil ? ["-s"] : []
+    }
+
+    func configuredPythonEnvironment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        if let runtimeRoot = bundledPythonRoot {
+            env["PYTHONHOME"] = runtimeRoot.path
+            env["PYTHONPATH"] = runtimeRoot.appendingPathComponent("site-packages").path
+        }
+        return env
+    }
+
+    private static func discoverPrecompiledDocScanner(root: URL) -> URL? {
+        let fm = FileManager.default
+        let candidates: [URL] = [
+            root.appendingPathComponent("bin/doc_scanner"),
+            Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/doc_scanner"),
+            Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/bin/doc_scanner"),
+            root.appendingPathComponent("scripts/doc_scanner")
+        ]
+        for url in candidates where fm.isExecutableFile(atPath: url.path) {
+            return url
+        }
+        return nil
+    }
+
+    private static func discoverPython(root: URL) -> (pythonURL: URL, bundledRoot: URL?) {
+        let fm = FileManager.default
+        let bundledRoot = root.appendingPathComponent("python_runtime")
+        let bundledPy = bundledRoot.appendingPathComponent("bin/python3.10")
+        if fm.isExecutableFile(atPath: bundledPy.path) {
+            return (bundledPy, bundledRoot)
+        }
+        let candidates = [
+            root.appendingPathComponent(".venv/bin/python3").path,
+            URL(fileURLWithPath: fm.currentDirectoryPath).appendingPathComponent(".venv/bin/python3").path,
+            "/opt/homebrew/bin/python3",
+            "/usr/local/bin/python3",
+            "/usr/bin/python3"
+        ]
+        for path in candidates where fm.isExecutableFile(atPath: path) {
+            return (URL(fileURLWithPath: path), nil)
+        }
+        return (URL(fileURLWithPath: "/usr/bin/python3"), nil)
+    }
+
+    func terminateWorkers() {
+        persistentWorker?.terminate()
+        persistentWorker = nil
+    }
+
+    func cancelActiveProcess() {
+        terminateWorkers()
+        processLock.lock()
+        let proc = activeProcess
+        processLock.unlock()
+        if let proc, proc.isRunning {
+            proc.terminate()
+        }
+    }
+
+    /// Preflight check (A1): verify Python dependencies (`cv2, numpy, PIL, pypdf`) and Vision helper binary/script.
+    func runPreflightCheck() -> PreflightReport {
+        let fm = FileManager.default
+        let hasVision = precompiledDocScannerURL != nil ||
+            (fm.isExecutableFile(atPath: swiftURL.path) && fm.fileExists(atPath: docScannerScript.path))
+
+        guard fm.isExecutableFile(atPath: pythonURL.path) else {
+            return PreflightReport(
+                isHealthy: false,
+                usingBundledPython: bundledPythonRoot != nil,
+                pythonPath: pythonURL.path,
+                pythonVersion: "Không tìm thấy",
+                opencvVersion: "—",
+                visionHelperAvailable: hasVision,
+                summary: "Không tìm thấy Python runtime (\(pythonURL.lastPathComponent)).",
+                remediation: "Build app qua macos_app/build_app.sh để đóng gói python_runtime hoặc chuyển sang chế độ Pure Swift Vision."
+            )
+        }
+
+        let probeProc = Process()
+        probeProc.executableURL = pythonURL
+        probeProc.arguments = pythonIsolationFlags + [
+            "-c",
+            "import sys, cv2, numpy, PIL, pypdf; print(f'{sys.version.split()[0]}|{cv2.__version__}')"
+        ]
+        probeProc.environment = configuredPythonEnvironment()
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        probeProc.standardOutput = outPipe
+        probeProc.standardError = errPipe
+
+        do {
+            try probeProc.run()
+            probeProc.waitUntilExit()
+        } catch {
+            return PreflightReport(
+                isHealthy: false,
+                usingBundledPython: bundledPythonRoot != nil,
+                pythonPath: pythonURL.path,
+                pythonVersion: "Lỗi khởi chạy",
+                opencvVersion: "—",
+                visionHelperAvailable: hasVision,
+                summary: "Không chạy được Python: \(error.localizedDescription)",
+                remediation: "Kiểm tra lại .venv hoặc chuyển Engine sang Pure Swift Vision."
+            )
+        }
+
+        let outStr = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let errStr = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        if probeProc.terminationStatus == 0 {
+            let parts = outStr.split(separator: "|", maxSplits: 1).map(String.init)
+            let pyVer = parts.first ?? "?"
+            let cvVer = parts.count > 1 ? parts[1] : "?"
+            let runtimeLabel = bundledPythonRoot != nil ? "Bundled Python \(pyVer)" : "Python \(pyVer)"
+            return PreflightReport(
+                isHealthy: true,
+                usingBundledPython: bundledPythonRoot != nil,
+                pythonPath: pythonURL.path,
+                pythonVersion: pyVer,
+                opencvVersion: cvVer,
+                visionHelperAvailable: hasVision,
+                summary: "\(runtimeLabel) • OpenCV \(cvVer) • \(precompiledDocScannerURL != nil ? "Vision compiled" : (hasVision ? "Vision script" : "No Vision"))",
+                remediation: nil
+            )
+        }
+
+        return PreflightReport(
+            isHealthy: false,
+            usingBundledPython: bundledPythonRoot != nil,
+            pythonPath: pythonURL.path,
+            pythonVersion: "Thiếu thư viện",
+            opencvVersion: "Thiếu",
+            visionHelperAvailable: hasVision,
+            summary: "Môi trường Python thiếu thư viện (cv2/numpy/Pillow/pypdf).",
+            remediation: "Chạy `uv pip install -r requirements.txt` trong repo hoặc chọn Engine 'Pure Swift Vision'. Chi tiết: \(errStr.split(separator: "\n").last ?? "")"
+        )
     }
 
     private var isBundledResourcesRoot: Bool {
@@ -120,28 +487,31 @@ final class ScannerBridge {
         throw ScannerBridgeError.workspaceNotFound
     }
 
-    private static func discoverPython(root: URL) -> URL {
-        let fm = FileManager.default
-        let candidates = [
-            root.appendingPathComponent(".venv/bin/python3").path,
-            URL(fileURLWithPath: fm.currentDirectoryPath).appendingPathComponent(".venv/bin/python3").path,
-            "/opt/homebrew/bin/python3",
-            "/usr/local/bin/python3",
-            "/usr/bin/python3"
-        ]
-        for path in candidates where fm.isExecutableFile(atPath: path) {
-            return URL(fileURLWithPath: path)
-        }
-        return URL(fileURLWithPath: "/usr/bin/python3")
+    static var previewCacheDirectory: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("pdfscanner_app_previews")
     }
 
-    func cancelActiveProcess() {
-        processLock.lock()
-        let proc = activeProcess
-        processLock.unlock()
-        if let proc, proc.isRunning {
-            proc.terminate()
+    static func cleanupTemporaryCaches() {
+        let fm = FileManager.default
+        let tmp = fm.temporaryDirectory
+        try? fm.removeItem(at: previewCacheDirectory)
+        if let entries = try? fm.contentsOfDirectory(at: tmp, includingPropertiesForKeys: nil) {
+            for url in entries {
+                let name = url.lastPathComponent
+                if name.hasPrefix("pdfscanner_preview_") || name.hasPrefix("pdfscanner_batch_") {
+                    try? fm.removeItem(at: url)
+                }
+            }
         }
+    }
+
+    private static func canonicalPath(_ url: URL) -> String {
+        url.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    private func decodeManifest(at manifestURL: URL) throws -> PipelineManifest {
+        let data = try Data(contentsOf: manifestURL)
+        return try JSONDecoder().decode(PipelineManifest.self, from: data)
     }
 
     func previewSinglePage(
@@ -152,34 +522,101 @@ final class ScannerBridge {
         let fm = FileManager.default
         let workDir = fm.temporaryDirectory.appendingPathComponent("pdfscanner_preview_\(UUID().uuidString)")
         let stageDir = workDir.appendingPathComponent("stage")
-        let debugDir = workDir.appendingPathComponent("debug")
-        let dummyPDF = workDir.appendingPathComponent("preview.pdf")
+        let emitDir = workDir.appendingPathComponent("emit")
+        let manifestURL = workDir.appendingPathComponent("manifest.json")
 
         try fm.createDirectory(at: stageDir, withIntermediateDirectories: true)
-        try fm.createDirectory(at: debugDir, withIntermediateDirectories: true)
-        defer { try? fm.removeItem(at: stageDir) }
+        try fm.createDirectory(at: emitDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: workDir) }
 
         onLog("[Preview] Chuẩn bị trang: \(item.displayName)...")
         let staged = try PDFToolsService.stageItemToImageFile(item: item, index: 0, stagingDir: stageDir)
 
-        try await executePipeline(
-            inputPathOrFiles: settings.engine == .pureSwiftVision ? [staged.path] : [stageDir.path],
-            outputPDF: dummyPDF,
-            debugDir: debugDir,
-            settings: settings,
-            onLog: onLog
-        )
+        var resolvedOutputPath: String?
+        if settings.engine == .hybridOpenCV {
+            guard fm.fileExists(atPath: batchScannerScript.path) else {
+                throw ScannerBridgeError.scriptNotFound(batchScannerScript.path)
+            }
+            if persistentWorker == nil {
+                persistentWorker = PersistentPythonWorker(
+                    pythonURL: pythonURL,
+                    pythonFlags: pythonIsolationFlags,
+                    scriptURL: batchScannerScript,
+                    environment: configuredPythonEnvironment(),
+                    workingDirectory: workspaceRoot
+                )
+            }
+            let payload: [String: Any] = [
+                "id": item.id.uuidString,
+                "input": staged.path,
+                "emit_dir": emitDir.path,
+                "mode": settings.mode.rawValue,
+                "auto_crop": settings.autoCrop,
+                "crop_engine": settings.cropEngine.rawValue,
+                "multipoint_points": settings.multipointPoints,
+                "page_size": settings.pageSize.rawValue,
+                "dpi": settings.dpi,
+                "margin": settings.margin,
+                "flatten_surface": settings.flattenSurface,
+                "balance_symmetry": settings.balanceSymmetry,
+                "min_confidence": settings.minConfidence,
+                "jpeg_quality": settings.jpegQuality
+            ]
+            let resp = try await persistentWorker!.runJob(payload: payload, onLog: onLog)
+            if resp.status != "ok" {
+                let msg = (resp.message?.isEmpty == false) ? resp.message! : "Không tạo được ảnh xem trước."
+                throw ScannerBridgeError.pageProcessingFailed(msg)
+            }
+            resolvedOutputPath = resp.output
+        } else {
+            do {
+                try await executePipeline(
+                    inputPathOrFiles: [staged.path],
+                    outputPDF: nil,
+                    emitDir: emitDir,
+                    manifestURL: manifestURL,
+                    settings: settings,
+                    onLog: onLog
+                )
+            } catch {
+                if fm.fileExists(atPath: manifestURL.path),
+                   let manifest = try? decodeManifest(at: manifestURL),
+                   let entry = manifest.results.first,
+                   entry.status != "ok",
+                   let msg = entry.message, !msg.isEmpty {
+                    throw ScannerBridgeError.pageProcessingFailed(msg)
+                }
+                throw error
+            }
 
-        let generated = try findSortedDebugImages(in: debugDir)
-        guard let firstImage = generated.first else {
+            guard fm.fileExists(atPath: manifestURL.path) else {
+                throw ScannerBridgeError.noPreviewGenerated
+            }
+            let manifest = try decodeManifest(at: manifestURL)
+            let targetKey = Self.canonicalPath(staged)
+            let matched = manifest.results.first(where: { Self.canonicalPath(URL(fileURLWithPath: $0.input)) == targetKey })
+                ?? manifest.results.first
+
+            guard let entry = matched else {
+                throw ScannerBridgeError.noPreviewGenerated
+            }
+            guard entry.status == "ok", let outPath = entry.output else {
+                let msg = (entry.message?.isEmpty == false) ? entry.message! : "Không tạo được ảnh xem trước."
+                throw ScannerBridgeError.pageProcessingFailed(msg)
+            }
+            resolvedOutputPath = outPath
+        }
+
+        guard let outPath = resolvedOutputPath, fm.fileExists(atPath: outPath) else {
             throw ScannerBridgeError.noPreviewGenerated
         }
 
-        let cacheDir = fm.temporaryDirectory.appendingPathComponent("pdfscanner_app_previews")
+        let outURL = URL(fileURLWithPath: outPath)
+        let outExt = outURL.pathExtension.isEmpty ? "jpg" : outURL.pathExtension.lowercased()
+        let cacheDir = Self.previewCacheDirectory
         try fm.createDirectory(at: cacheDir, withIntermediateDirectories: true)
-        let persistentPreview = cacheDir.appendingPathComponent("\(item.id.uuidString)_\(UUID().uuidString.prefix(6)).jpg")
-        try fm.copyItem(at: firstImage, to: persistentPreview)
-        try? fm.removeItem(at: workDir)
+        let persistentPreview = cacheDir.appendingPathComponent("\(item.id.uuidString)_\(UUID().uuidString.prefix(6)).\(outExt)")
+        try fm.copyItem(at: outURL, to: persistentPreview)
         return persistentPreview
     }
 
@@ -188,7 +625,7 @@ final class ScannerBridge {
         settings: ScanSettings,
         outputPDF: URL,
         onLog: @escaping (String) -> Void
-    ) async throws -> [URL] {
+    ) async throws -> BatchScanResult {
         guard !items.isEmpty else {
             throw PDFToolError.emptyInput("Danh sách trang đang trống.")
         }
@@ -196,35 +633,42 @@ final class ScannerBridge {
         let fm = FileManager.default
         try fm.createDirectory(at: outputPDF.deletingLastPathComponent(), withIntermediateDirectories: true)
 
-        var resolvedURLs: [URL?] = Array(repeating: nil, count: items.count)
+        var resolvedMap: [UUID: URL] = [:]
+        var itemErrors: [UUID: String] = [:]
         var missingIndices: [Int] = []
+
         for (idx, item) in items.enumerated() {
-            if let cached = item.processedPreviewURL, fm.fileExists(atPath: cached.path) {
-                resolvedURLs[idx] = cached
+            let expectedKey = PDFToolsService.previewCacheKey(for: item, settings: settings)
+            let keyValid = (item.processedCacheKey == nil || item.processedCacheKey == expectedKey)
+            if keyValid, let cached = item.processedPreviewURL, fm.fileExists(atPath: cached.path) {
+                resolvedMap[item.id] = cached
             } else {
                 missingIndices.append(idx)
             }
         }
 
         if missingIndices.isEmpty {
-            let readyURLs = resolvedURLs.compactMap { $0 }
-            onLog("[Cache] Tái sử dụng toàn bộ \(readyURLs.count) trang đã scan -> đóng gói PDF tức thì...")
+            let readyPairs = items.compactMap { item -> (URL, InputPageItem)? in
+                resolvedMap[item.id].map { ($0, item) }
+            }
+            onLog("[Cache] Tái sử dụng toàn bộ \(readyPairs.count) trang đã scan -> đóng gói PDF tức thì...")
             try PDFToolsService.compileProcessedImagesToPDF(
-                imageURLs: readyURLs,
+                imageURLs: readyPairs.map { $0.0 },
                 destinationURL: outputPDF,
-                settings: settings
+                settings: settings,
+                sourceItems: readyPairs.map { $0.1 }
             )
-            return readyURLs
+            return BatchScanResult(resolvedURLs: resolvedMap, errors: [:])
         }
 
         let workDir = fm.temporaryDirectory.appendingPathComponent("pdfscanner_batch_\(UUID().uuidString)")
         let stageDir = workDir.appendingPathComponent("stage")
-        let debugDir = workDir.appendingPathComponent("debug")
+        let emitDir = workDir.appendingPathComponent("emit")
+        let manifestURL = workDir.appendingPathComponent("manifest.json")
         try fm.createDirectory(at: stageDir, withIntermediateDirectories: true)
-        try fm.createDirectory(at: debugDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: emitDir, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: workDir) }
 
-        let allMissing = missingIndices.count == items.count
         let reusedCount = items.count - missingIndices.count
         if reusedCount > 0 {
             onLog("[Batch] Tái sử dụng \(reusedCount) trang đã scan, chỉ xử lý \(missingIndices.count) trang còn lại...")
@@ -233,110 +677,177 @@ final class ScannerBridge {
         }
 
         var stagedFiles: [URL] = []
+        var stagedPathToID: [String: UUID] = [:]
         for (seq, idx) in missingIndices.enumerated() {
-            let staged = try PDFToolsService.stageItemToImageFile(item: items[idx], index: seq, stagingDir: stageDir)
-            stagedFiles.append(staged)
+            let item = items[idx]
+            do {
+                let staged = try PDFToolsService.stageItemToImageFile(item: item, index: seq, stagingDir: stageDir)
+                stagedFiles.append(staged)
+                stagedPathToID[Self.canonicalPath(staged)] = item.id
+            } catch {
+                let msg = error.localizedDescription
+                itemErrors[item.id] = msg
+                onLog("[WARN] Lỗi chuẩn hóa trang '\(item.displayName)': \(msg)")
+            }
         }
 
-        let inputArgs = settings.engine == .pureSwiftVision
-            ? stagedFiles.map { $0.path }
-            : [stageDir.path]
-        let pipelinePDF = allMissing ? outputPDF : workDir.appendingPathComponent("partial.pdf")
+        if !stagedFiles.isEmpty {
+            let inputArgs = settings.engine == .pureSwiftVision
+                ? stagedFiles.map { $0.path }
+                : [stageDir.path]
 
-        try await executePipeline(
-            inputPathOrFiles: inputArgs,
-            outputPDF: pipelinePDF,
-            debugDir: debugDir,
-            settings: settings,
-            onLog: onLog
-        )
+            var pipelineFailure: Error?
+            do {
+                try await executePipeline(
+                    inputPathOrFiles: inputArgs,
+                    outputPDF: nil,
+                    emitDir: emitDir,
+                    manifestURL: manifestURL,
+                    settings: settings,
+                    onLog: onLog
+                )
+            } catch {
+                pipelineFailure = error
+            }
 
-        let debugImages = try findSortedDebugImages(in: debugDir)
-        let cacheDir = fm.temporaryDirectory.appendingPathComponent("pdfscanner_app_previews")
-        try fm.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+            if fm.fileExists(atPath: manifestURL.path) {
+                let manifest = try decodeManifest(at: manifestURL)
+                let cacheDir = Self.previewCacheDirectory
+                try fm.createDirectory(at: cacheDir, withIntermediateDirectories: true)
 
-        for (seq, idx) in missingIndices.enumerated() where seq < debugImages.count {
-            let dbg = debugImages[seq]
-            let dest = cacheDir.appendingPathComponent("\(items[idx].id.uuidString)_\(UUID().uuidString.prefix(6)).jpg")
-            try? fm.copyItem(at: dbg, to: dest)
-            resolvedURLs[idx] = dest
+                var seenIDs: Set<UUID> = []
+                for entry in manifest.results {
+                    let canonInput = Self.canonicalPath(URL(fileURLWithPath: entry.input))
+                    guard let itemID = stagedPathToID[canonInput] else { continue }
+                    seenIDs.insert(itemID)
+
+                    if entry.status == "ok", let outPath = entry.output, fm.fileExists(atPath: outPath) {
+                        let outURL = URL(fileURLWithPath: outPath)
+                        let outExt = outURL.pathExtension.isEmpty ? "jpg" : outURL.pathExtension.lowercased()
+                        let dest = cacheDir.appendingPathComponent("\(itemID.uuidString)_\(UUID().uuidString.prefix(6)).\(outExt)")
+                        do {
+                            try fm.copyItem(at: outURL, to: dest)
+                            resolvedMap[itemID] = dest
+                        } catch {
+                            itemErrors[itemID] = "Không thể lưu ảnh cache: \(error.localizedDescription)"
+                        }
+                    } else {
+                        let msg = (entry.message?.isEmpty == false) ? entry.message! : "Không thể xử lý trang này."
+                        itemErrors[itemID] = msg
+                    }
+                }
+
+                for (_, itemID) in stagedPathToID where !seenIDs.contains(itemID) && itemErrors[itemID] == nil {
+                    itemErrors[itemID] = "Trang không xuất hiện trong manifest kết quả."
+                }
+            } else if let pipelineFailure {
+                throw pipelineFailure
+            } else {
+                throw ScannerBridgeError.noPreviewGenerated
+            }
         }
 
-        let finalURLs = resolvedURLs.compactMap { $0 }
-        guard finalURLs.count == items.count else {
-            throw ScannerBridgeError.noPreviewGenerated
+        let validPairs = items.compactMap { item -> (URL, InputPageItem)? in
+            resolvedMap[item.id].map { ($0, item) }
         }
-
-        if !allMissing {
-            onLog("[Batch] Đang đóng gói \(finalURLs.count) trang thành file PDF...")
-            try PDFToolsService.compileProcessedImagesToPDF(
-                imageURLs: finalURLs,
-                destinationURL: outputPDF,
-                settings: settings
+        guard !validPairs.isEmpty else {
+            let details = items.compactMap { item -> String? in
+                guard let err = itemErrors[item.id] else { return nil }
+                return "\(item.displayName): \(err)"
+            }.joined(separator: "; ")
+            throw ScannerBridgeError.pageProcessingFailed(
+                details.isEmpty ? "Không có trang hợp lệ nào được xử lý." : "Tất cả trang đều lỗi (\(details))."
             )
         }
-        return finalURLs
+
+        onLog("[Batch] Đang đóng gói \(validPairs.count) trang hợp lệ thành file PDF...")
+        try PDFToolsService.compileProcessedImagesToPDF(
+            imageURLs: validPairs.map { $0.0 },
+            destinationURL: outputPDF,
+            settings: settings,
+            sourceItems: validPairs.map { $0.1 }
+        )
+        return BatchScanResult(resolvedURLs: resolvedMap, errors: itemErrors)
     }
 
+    /// Vector-preserving PDF compression (B5): preserves pure text/vector pages and shrinks embedded raster images with target-size search.
     func compressPDF(
         sourcePDF: URL,
         outputPDF: URL,
-        dpi: Int,
-        mode: EnhanceMode,
-        autoCrop: Bool,
+        dpi: Int = AppConstants.defaultCompressDPI,
+        jpegQuality: Int = AppConstants.defaultCompressJPEGQuality,
+        targetMB: Double = 0.0,
+        mode: EnhanceMode = .original,
+        autoCrop: Bool = false,
         onLog: @escaping (String) -> Void
     ) async throws -> CompressionResult {
         let fm = FileManager.default
-        let beforeAttr = try fm.attributesOfItem(atPath: sourcePDF.path)
-        let beforeBytes = (beforeAttr[.size] as? Int64) ?? 0
+        guard fm.fileExists(atPath: pdfCompressorScript.path) else {
+            throw ScannerBridgeError.scriptNotFound(pdfCompressorScript.path)
+        }
+        let reportURL = fm.temporaryDirectory.appendingPathComponent("pdfcomp_rep_\(UUID().uuidString).json")
+        defer { try? fm.removeItem(at: reportURL) }
 
-        let items = PDFToolsService.loadInputItems(from: [sourcePDF])
-        guard !items.isEmpty else {
-            throw PDFToolError.invalidPDF(sourcePDF)
+        var args = pythonIsolationFlags + [
+            pdfCompressorScript.path,
+            sourcePDF.path,
+            outputPDF.path,
+            "--dpi", String(max(72, dpi)),
+            "--jpeg-quality", String(max(35, min(95, jpegQuality))),
+            "--mode", mode.rawValue,
+            "--json-report", reportURL.path
+        ]
+        if targetMB > 0 {
+            args.append(contentsOf: ["--target-mb", String(format: "%.2f", targetMB)])
+        }
+        if autoCrop {
+            args.append("--auto-crop")
         }
 
-        var settings = ScanSettings()
-        settings.engine = .hybridOpenCV
-        settings.mode = mode
-        settings.dpi = dpi
-        settings.autoCrop = autoCrop
-        settings.multipointPoints = autoCrop ? 32 : 0
-        settings.flattenSurface = autoCrop
-        settings.balanceSymmetry = autoCrop
-        settings.pageSize = .a4
-
-        _ = try await runBatchScan(
-            items: items,
-            settings: settings,
-            outputPDF: outputPDF,
+        onLog("[Compress] \(pythonURL.lastPathComponent) \(pdfCompressorScript.lastPathComponent) (dpi=\(dpi), target=\(targetMB > 0 ? String(format: "%.1f MB", targetMB) : "off"), mode=\(mode.title))")
+        let status = try await runProcessStreaming(
+            executableURL: pythonURL,
+            arguments: args,
+            environment: configuredPythonEnvironment(),
+            workingDirectory: workspaceRoot,
             onLog: onLog
         )
+        if status != 0 {
+            throw ScannerBridgeError.processFailed(status, "Không thể nén PDF.")
+        }
 
+        if fm.fileExists(atPath: reportURL.path),
+           let data = try? Data(contentsOf: reportURL),
+           let rep = try? JSONDecoder().decode(CompressorJSONReport.self, from: data) {
+            return CompressionResult(
+                outputURL: outputPDF,
+                beforeBytes: rep.before_bytes,
+                afterBytes: rep.after_bytes,
+                pageCount: rep.pages,
+                vectorPagesPreserved: rep.vector_pages,
+                imagePagesRecompressed: rep.image_pages,
+                targetAchieved: rep.target_achieved,
+                usedDPI: rep.used_dpi,
+                usedQuality: rep.used_quality,
+                detailsMessage: rep.message
+            )
+        }
+
+        let beforeAttr = try fm.attributesOfItem(atPath: sourcePDF.path)
         let afterAttr = try fm.attributesOfItem(atPath: outputPDF.path)
-        let afterBytes = (afterAttr[.size] as? Int64) ?? 0
         return CompressionResult(
             outputURL: outputPDF,
-            beforeBytes: beforeBytes,
-            afterBytes: afterBytes,
-            pageCount: items.count
+            beforeBytes: (beforeAttr[.size] as? Int64) ?? 0,
+            afterBytes: (afterAttr[.size] as? Int64) ?? 0,
+            pageCount: PDFDocument(url: outputPDF)?.pageCount ?? 0
         )
-    }
-
-    private func findSortedDebugImages(in dir: URL) throws -> [URL] {
-        let entries = try FileManager.default.contentsOfDirectory(
-            at: dir,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        )
-        return entries
-            .filter { ["jpg", "jpeg", "png"].contains($0.pathExtension.lowercased()) }
-            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
     }
 
     private func executePipeline(
         inputPathOrFiles: [String],
-        outputPDF: URL,
-        debugDir: URL,
+        outputPDF: URL?,
+        emitDir: URL,
+        manifestURL: URL,
         settings: ScanSettings,
         onLog: @escaping (String) -> Void
     ) async throws {
@@ -349,44 +860,58 @@ final class ScannerBridge {
                 throw ScannerBridgeError.scriptNotFound(batchScannerScript.path)
             }
             executable = pythonURL
+            args.append(contentsOf: pythonIsolationFlags)
             args.append(batchScannerScript.path)
             args.append(contentsOf: inputPathOrFiles)
-            args.append(contentsOf: ["--output", outputPDF.path])
+            if let outputPDF {
+                args.append(contentsOf: ["--output", outputPDF.path])
+            }
             args.append(contentsOf: ["--mode", settings.mode.rawValue])
             args.append(contentsOf: ["--crop-engine", settings.cropEngine.rawValue])
             args.append(contentsOf: ["--multipoint-points", String(settings.multipointPoints)])
             args.append(contentsOf: ["--page-size", settings.pageSize.rawValue])
             args.append(contentsOf: ["--dpi", String(settings.dpi)])
             args.append(contentsOf: ["--margin", String(format: "%.1f", settings.margin)])
+            args.append(contentsOf: ["--jpeg-quality", String(settings.jpegQuality)])
             args.append(contentsOf: ["--min-confidence", String(format: "%.2f", settings.minConfidence)])
-            args.append(contentsOf: ["--save-debug", debugDir.path])
+            args.append(contentsOf: ["--emit-dir", emitDir.path])
+            args.append(contentsOf: ["--manifest", manifestURL.path])
             if !settings.autoCrop { args.append("--no-crop") }
             if !settings.flattenSurface { args.append("--no-flatten") }
-            if !settings.balanceSymmetry { args.append("--no-symmetry") }
+            if settings.balanceSymmetry {
+                args.append("--symmetry")
+            } else {
+                args.append("--no-symmetry")
+            }
 
         case .pureSwiftVision:
-            guard FileManager.default.fileExists(atPath: docScannerScript.path) else {
-                throw ScannerBridgeError.scriptNotFound(docScannerScript.path)
+            if let compiled = precompiledDocScannerURL {
+                executable = compiled
+            } else {
+                guard FileManager.default.fileExists(atPath: docScannerScript.path) else {
+                    throw ScannerBridgeError.scriptNotFound(docScannerScript.path)
+                }
+                executable = swiftURL
+                args.append(docScannerScript.path)
             }
-            executable = swiftURL
-            args.append(docScannerScript.path)
-            args.append(contentsOf: ["--output", outputPDF.path])
+            if let outputPDF {
+                args.append(contentsOf: ["--output", outputPDF.path])
+            }
             args.append(contentsOf: ["--mode", settings.mode.swiftVisionFallbackMode])
             args.append(contentsOf: ["--page-size", settings.pageSize.rawValue])
             args.append(contentsOf: ["--dpi", String(settings.dpi)])
             args.append(contentsOf: ["--margin", String(format: "%.1f", settings.margin)])
+            args.append(contentsOf: ["--jpeg-quality", String(settings.jpegQuality)])
             args.append(contentsOf: ["--min-confidence", String(format: "%.2f", settings.minConfidence)])
-            args.append(contentsOf: ["--save-debug", debugDir.path])
+            args.append(contentsOf: ["--emit-dir", emitDir.path])
+            args.append(contentsOf: ["--manifest", manifestURL.path])
             if !settings.autoCrop { args.append("--no-crop") }
             args.append(contentsOf: inputPathOrFiles)
         }
 
         onLog("[Exec] \(executable.lastPathComponent) \(args.map { $0.contains(" ") ? "\"\($0)\"" : $0 }.joined(separator: " "))")
 
-        var env = ProcessInfo.processInfo.environment
-        env["PYTHONUNBUFFERED"] = "1"
-        env["PYTHONDONTWRITEBYTECODE"] = "1"
-
+        let env = configuredPythonEnvironment()
         let status = try await runProcessStreaming(
             executableURL: executable,
             arguments: args,
@@ -406,61 +931,65 @@ final class ScannerBridge {
         workingDirectory: URL,
         onLog: @escaping (String) -> Void
     ) async throws -> Int32 {
-        try await withCheckedThrowingContinuation { continuation in
-            let process = Process()
-            process.executableURL = executableURL
-            process.arguments = arguments
-            process.environment = environment
-            process.currentDirectoryURL = workingDirectory
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let process = Process()
+                process.executableURL = executableURL
+                process.arguments = arguments
+                process.environment = environment
+                process.currentDirectoryURL = workingDirectory
 
-            let outPipe = Pipe()
-            let errPipe = Pipe()
-            process.standardOutput = outPipe
-            process.standardError = errPipe
+                let outPipe = Pipe()
+                let errPipe = Pipe()
+                process.standardOutput = outPipe
+                process.standardError = errPipe
 
-            let outAccumulator = LinePipeAccumulator(prefix: "", onLog: onLog)
-            let errAccumulator = LinePipeAccumulator(prefix: "[stderr] ", onLog: onLog)
+                let outAccumulator = LinePipeAccumulator(prefix: "", onLog: onLog)
+                let errAccumulator = LinePipeAccumulator(prefix: "[stderr] ", onLog: onLog)
 
-            outPipe.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                outAccumulator.append(data)
+                outPipe.fileHandleForReading.readabilityHandler = { handle in
+                    let data = handle.availableData
+                    outAccumulator.append(data)
+                }
+
+                errPipe.fileHandleForReading.readabilityHandler = { handle in
+                    let data = handle.availableData
+                    errAccumulator.append(data)
+                }
+
+                process.terminationHandler = { proc in
+                    outPipe.fileHandleForReading.readabilityHandler = nil
+                    errPipe.fileHandleForReading.readabilityHandler = nil
+
+                    let tailOut = (try? outPipe.fileHandleForReading.readToEnd()) ?? Data()
+                    let tailErr = (try? errPipe.fileHandleForReading.readToEnd()) ?? Data()
+
+                    outAccumulator.flush(trailingData: tailOut)
+                    errAccumulator.flush(trailingData: tailErr)
+
+                    self.processLock.lock()
+                    self.activeProcess = nil
+                    self.processLock.unlock()
+
+                    continuation.resume(returning: proc.terminationStatus)
+                }
+
+                do {
+                    self.processLock.lock()
+                    self.activeProcess = process
+                    self.processLock.unlock()
+                    try process.run()
+                } catch {
+                    self.processLock.lock()
+                    self.activeProcess = nil
+                    self.processLock.unlock()
+                    outPipe.fileHandleForReading.readabilityHandler = nil
+                    errPipe.fileHandleForReading.readabilityHandler = nil
+                    continuation.resume(throwing: error)
+                }
             }
-
-            errPipe.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                errAccumulator.append(data)
-            }
-
-            process.terminationHandler = { proc in
-                outPipe.fileHandleForReading.readabilityHandler = nil
-                errPipe.fileHandleForReading.readabilityHandler = nil
-
-                let tailOut = (try? outPipe.fileHandleForReading.readToEnd()) ?? Data()
-                let tailErr = (try? errPipe.fileHandleForReading.readToEnd()) ?? Data()
-
-                outAccumulator.flush(trailingData: tailOut)
-                errAccumulator.flush(trailingData: tailErr)
-
-                self.processLock.lock()
-                self.activeProcess = nil
-                self.processLock.unlock()
-
-                continuation.resume(returning: proc.terminationStatus)
-            }
-
-            do {
-                self.processLock.lock()
-                self.activeProcess = process
-                self.processLock.unlock()
-                try process.run()
-            } catch {
-                self.processLock.lock()
-                self.activeProcess = nil
-                self.processLock.unlock()
-                outPipe.fileHandleForReading.readabilityHandler = nil
-                errPipe.fileHandleForReading.readabilityHandler = nil
-                continuation.resume(throwing: error)
-            }
+        } onCancel: {
+            self.cancelActiveProcess()
         }
     }
 }

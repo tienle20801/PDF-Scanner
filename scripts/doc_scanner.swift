@@ -8,6 +8,7 @@ import Vision
 enum ScanMode: String {
     case clean
     case bw
+    case grayscale
     case original
 }
 
@@ -23,40 +24,57 @@ struct Config {
     var pageSize: PageSizeOption = .a4
     var dpi: Double = 200.0
     var margin: Double = 20.0
+    var jpegQuality: Int = 88
     var minConfidence: Float = 0.45
     var noCrop: Bool = false
+    var quadOnly: Bool = false
+    var emitDir: String? = nil
+    var manifestPath: String? = nil
     var saveDebugDir: String? = nil
     var inputs: [String] = []
 }
 
 struct PageResult: Codable {
+    let index: Int
+    let input: String
     let file: String
+    let status: String
+    let output: String?
+    let message: String
     let detected: Bool
     let method: String
     let confidence: Float
     let width: Int
     let height: Int
+    let quad: [[Double]]?
 }
 
 struct SummaryOutput: Codable {
-    let output: String
+    let engine: String
+    let output: String?
     let pages: Int
+    let pages_error: Int
     let size_bytes: Int64
     let results: [PageResult]
 }
 
 func printUsage() {
     let usage = """
-    Usage: doc_scanner.swift --output <out.pdf> [options] <image_or_dir...>
+    Usage: doc_scanner.swift [--output <out.pdf>] [options] <image_or_dir...>
 
     Options:
-      --output <file.pdf>       Output PDF file path (required)
-      --mode clean|bw|original  Enhancement mode (default: clean)
+      --output <file.pdf>       Output PDF file path (required unless --emit-dir or --quad-only is set)
+      --mode clean|bw|grayscale|original
+                                Enhancement mode (default: clean)
       --page-size a4|letter|fit PDF page size (default: a4)
       --dpi <number>            Target DPI for downscaling & fit sizing (default: 200)
       --margin <pts>            Page margin in points for a4/letter (default: 20)
+      --jpeg-quality <1..100>   JPEG compression quality (default: 88)
       --min-confidence <0..1>   Minimum boundary detection confidence (default: 0.45)
       --no-crop                 Skip automatic document boundary detection
+      --quad-only               Detect document 4-corner quads only and write JSON/manifest (no image/PDF encode)
+      --emit-dir <dir>          Directory to emit per-page processed JPEGs
+      --manifest <file.json>    Path to write JSON manifest of per-page results
       --save-debug <dir>        Save cropped & enhanced images for inspection
       -h, --help                Show this help
     """
@@ -80,7 +98,7 @@ func parseArgs() -> Config? {
         case "--mode":
             i += 1
             guard i < args.count, let m = ScanMode(rawValue: args[i].lowercased()) else {
-                fputs("Invalid --mode (expected clean|bw|original)\n", stderr)
+                fputs("Invalid --mode (expected clean|bw|grayscale|original)\n", stderr)
                 return nil
             }
             config.mode = m
@@ -105,6 +123,13 @@ func parseArgs() -> Config? {
                 return nil
             }
             config.margin = v
+        case "--jpeg-quality":
+            i += 1
+            guard i < args.count, let q = Int(args[i]), q >= 1, q <= 100 else {
+                fputs("Invalid --jpeg-quality (expected 1..100)\n", stderr)
+                return nil
+            }
+            config.jpegQuality = q
         case "--min-confidence":
             i += 1
             guard i < args.count, let v = Float(args[i]), v >= 0.0, v <= 1.0 else {
@@ -114,6 +139,16 @@ func parseArgs() -> Config? {
             config.minConfidence = v
         case "--no-crop":
             config.noCrop = true
+        case "--quad-only":
+            config.quadOnly = true
+        case "--emit-dir":
+            i += 1
+            guard i < args.count else { fputs("Missing value for --emit-dir\n", stderr); return nil }
+            config.emitDir = args[i]
+        case "--manifest":
+            i += 1
+            guard i < args.count else { fputs("Missing value for --manifest\n", stderr); return nil }
+            config.manifestPath = args[i]
         case "--save-debug":
             i += 1
             guard i < args.count else { fputs("Missing value for --save-debug\n", stderr); return nil }
@@ -127,7 +162,7 @@ func parseArgs() -> Config? {
         }
         i += 1
     }
-    if config.outputPath.isEmpty || config.inputs.isEmpty {
+    if (config.outputPath.isEmpty && config.emitDir == nil && !config.quadOnly) || config.inputs.isEmpty {
         printUsage()
         return nil
     }
@@ -136,30 +171,52 @@ func parseArgs() -> Config? {
 
 let supportedExts = Set(["jpg", "jpeg", "png", "heic", "heif", "webp", "tif", "tiff", "bmp"])
 
-func collectImageURLs(inputs: [String]) -> [URL] {
+struct InputCandidate {
+    let url: URL
+    let canonicalPath: String
+    let preflightError: String?
+}
+
+func canonicalPath(_ url: URL) -> String {
+    url.standardizedFileURL.resolvingSymlinksInPath().path
+}
+
+func sanitizeFileStem(_ raw: String) -> String {
+    let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+    let scalars = raw.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" }
+    let s = String(scalars).trimmingCharacters(in: CharacterSet(charactersIn: "_"))
+    return s.isEmpty ? "page" : s
+}
+
+func collectInputCandidates(inputs: [String]) -> [InputCandidate] {
     let fm = FileManager.default
-    var urls: [URL] = []
+    var candidates: [InputCandidate] = []
     for path in inputs {
         let expanded = (path as NSString).expandingTildeInPath
+        let url = URL(fileURLWithPath: expanded)
+        let canon = canonicalPath(url)
         var isDir: ObjCBool = false
         guard fm.fileExists(atPath: expanded, isDirectory: &isDir) else {
             fputs("[WARN] Input path not found: \(expanded)\n", stderr)
+            candidates.append(InputCandidate(url: url, canonicalPath: canon, preflightError: "Input path not found: \(url.lastPathComponent)"))
             continue
         }
-        let url = URL(fileURLWithPath: expanded)
         if isDir.boolValue {
             if let items = try? fm.contentsOfDirectory(at: url, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
                 let imgs = items.filter { supportedExts.contains($0.pathExtension.lowercased()) }
                     .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
-                urls.append(contentsOf: imgs)
+                for item in imgs {
+                    candidates.append(InputCandidate(url: item, canonicalPath: canonicalPath(item), preflightError: nil))
+                }
             }
         } else if supportedExts.contains(url.pathExtension.lowercased()) {
-            urls.append(url)
+            candidates.append(InputCandidate(url: url, canonicalPath: canon, preflightError: nil))
         } else {
             fputs("[WARN] Unsupported file extension: \(url.lastPathComponent)\n", stderr)
+            candidates.append(InputCandidate(url: url, canonicalPath: canon, preflightError: "Unsupported file extension: \(url.lastPathComponent)"))
         }
     }
-    return urls
+    return candidates
 }
 
 func normalizeOrigin(_ image: CIImage) -> CIImage {
@@ -247,6 +304,26 @@ func applyEnhancement(to image: CIImage, mode: ScanMode) -> CIImage {
             usm.setValue(0.6, forKey: kCIInputIntensityKey)
             if let out = usm.outputImage { current = out }
         }
+    case .grayscale:
+        if let hs = CIFilter(name: "CIHighlightShadowAdjust") {
+            hs.setValue(current, forKey: kCIInputImageKey)
+            hs.setValue(0.40, forKey: "inputShadowAmount")
+            hs.setValue(0.95, forKey: "inputHighlightAmount")
+            if let out = hs.outputImage { current = out }
+        }
+        if let cc = CIFilter(name: "CIColorControls") {
+            cc.setValue(current, forKey: kCIInputImageKey)
+            cc.setValue(1.35, forKey: kCIInputContrastKey)
+            cc.setValue(0.05, forKey: kCIInputBrightnessKey)
+            cc.setValue(0.0, forKey: kCIInputSaturationKey)
+            if let out = cc.outputImage { current = out }
+        }
+        if let usm = CIFilter(name: "CIUnsharpMask") {
+            usm.setValue(current, forKey: kCIInputImageKey)
+            usm.setValue(1.5, forKey: kCIInputRadiusKey)
+            usm.setValue(0.65, forKey: kCIInputIntensityKey)
+            if let out = usm.outputImage { current = out }
+        }
     case .bw:
         if let noir = CIFilter(name: "CIPhotoEffectNoir") {
             noir.setValue(current, forKey: kCIInputImageKey)
@@ -306,20 +383,61 @@ func downscaleIfNeeded(_ image: CIImage, maxPixelWidth: CGFloat, maxPixelHeight:
     return image
 }
 
+func writeManifest(_ summary: SummaryOutput, to manifestPath: String?) {
+    guard let manifestPath else { return }
+    let expanded = (manifestPath as NSString).expandingTildeInPath
+    let manifestURL = URL(fileURLWithPath: expanded)
+    try? FileManager.default.createDirectory(at: manifestURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    if let data = try? encoder.encode(summary) {
+        try? data.write(to: manifestURL, options: .atomic)
+    }
+}
+
 func main() -> Int32 {
     guard let config = parseArgs() else { return 1 }
 
-    let imageURLs = collectImageURLs(inputs: config.inputs)
-    if imageURLs.isEmpty {
+    let candidates = collectInputCandidates(inputs: config.inputs)
+    if candidates.isEmpty {
         fputs("[ERROR] No valid input images found.\n", stderr)
+        writeManifest(
+            SummaryOutput(
+                engine: "pure_swift_vision",
+                output: config.outputPath.isEmpty ? nil : config.outputPath,
+                pages: 0,
+                pages_error: 0,
+                size_bytes: 0,
+                results: []
+            ),
+            to: config.manifestPath
+        )
         return 1
     }
 
     let fm = FileManager.default
-    let outputExpanded = (config.outputPath as NSString).expandingTildeInPath
-    let outputURL = URL(fileURLWithPath: outputExpanded)
-    let outputDir = outputURL.deletingLastPathComponent()
-    try? fm.createDirectory(at: outputDir, withIntermediateDirectories: true)
+    var outputURL: URL? = nil
+    var pdfContext: CGContext? = nil
+    if !config.outputPath.isEmpty {
+        let outputExpanded = (config.outputPath as NSString).expandingTildeInPath
+        let u = URL(fileURLWithPath: outputExpanded)
+        try? fm.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var dummyBox = CGRect(x: 0, y: 0, width: 595.28, height: 841.89)
+        guard let ctx = CGContext(u as CFURL, mediaBox: &dummyBox, nil) else {
+            fputs("[ERROR] Could not create PDF context at \(u.path)\n", stderr)
+            return 1
+        }
+        outputURL = u
+        pdfContext = ctx
+    }
+
+    var emitDirURL: URL? = nil
+    if let dir = config.emitDir {
+        let expandedDir = (dir as NSString).expandingTildeInPath
+        let u = URL(fileURLWithPath: expandedDir)
+        try? fm.createDirectory(at: u, withIntermediateDirectories: true)
+        emitDirURL = u
+    }
 
     var debugDirURL: URL? = nil
     if let dir = config.saveDebugDir {
@@ -332,115 +450,255 @@ func main() -> Int32 {
     let ciContext = CIContext(options: [.useSoftwareRenderer: false])
     let colorSpace = CGColorSpaceCreateDeviceRGB()
 
-    var dummyBox = CGRect(x: 0, y: 0, width: 595.28, height: 841.89)
-    guard let pdfContext = CGContext(outputURL as CFURL, mediaBox: &dummyBox, nil) else {
-        fputs("[ERROR] Could not create PDF context at \(outputURL.path)\n", stderr)
-        return 1
-    }
-
     var results: [PageResult] = []
     var renderedPages = 0
+    var errorPages = 0
 
-    for (idx, imgURL) in imageURLs.enumerated() {
-        guard let rawCI = CIImage(contentsOf: imgURL, options: [.applyOrientationProperty: true]) else {
-            fputs("[WARN] Failed to load image: \(imgURL.lastPathComponent)\n", stderr)
-            continue
-        }
-        var working = normalizeOrigin(rawCI)
-        var detected = false
-        var method = "none"
-        var confidence: Float = 0.0
-
-        if !config.noCrop {
-            if let (obs, detMethod) = detectDocumentQuad(in: working, minConfidence: config.minConfidence),
-               let warped = applyPerspectiveCorrection(to: working, observation: obs) {
-                working = warped
-                detected = true
-                method = detMethod
-                confidence = obs.confidence
-            } else {
-                fputs("[WARN] No document boundary detected for \(imgURL.lastPathComponent), using full image\n", stderr)
+    for (idx, candidate) in candidates.enumerated() {
+        autoreleasepool {
+            let imgURL = candidate.url
+            if let preErr = candidate.preflightError {
+                errorPages += 1
+                results.append(PageResult(
+                    index: idx,
+                    input: candidate.canonicalPath,
+                    file: imgURL.lastPathComponent,
+                    status: "error",
+                    output: nil,
+                    message: preErr,
+                    detected: false,
+                    method: "none",
+                    confidence: 0.0,
+                    width: 0,
+                    height: 0,
+                    quad: nil
+                ))
+                return
             }
+
+            guard let rawCI = CIImage(contentsOf: imgURL, options: [.applyOrientationProperty: true]),
+                  rawCI.extent.width > 0, rawCI.extent.height > 0 else {
+                let msg = "Failed to load image: \(imgURL.lastPathComponent)"
+                fputs("[WARN] \(msg)\n", stderr)
+                errorPages += 1
+                results.append(PageResult(
+                    index: idx,
+                    input: candidate.canonicalPath,
+                    file: imgURL.lastPathComponent,
+                    status: "error",
+                    output: nil,
+                    message: msg,
+                    detected: false,
+                    method: "none",
+                    confidence: 0.0,
+                    width: 0,
+                    height: 0,
+                    quad: nil
+                ))
+                return
+            }
+
+            var working = normalizeOrigin(rawCI)
+            var detected = false
+            var method = "none"
+            var confidence: Float = 0.0
+            var quadPixels: [[Double]]? = nil
+            let origW = Int(working.extent.width)
+            let origH = Int(working.extent.height)
+
+            if !config.noCrop {
+                if let (obs, detMethod) = detectDocumentQuad(in: working, minConfidence: config.minConfidence) {
+                    detected = true
+                    method = detMethod
+                    confidence = obs.confidence
+                    let ext = working.extent
+                    quadPixels = [
+                        [Double(obs.topLeft.x * ext.width), Double((1.0 - obs.topLeft.y) * ext.height)],
+                        [Double(obs.topRight.x * ext.width), Double((1.0 - obs.topRight.y) * ext.height)],
+                        [Double(obs.bottomRight.x * ext.width), Double((1.0 - obs.bottomRight.y) * ext.height)],
+                        [Double(obs.bottomLeft.x * ext.width), Double((1.0 - obs.bottomLeft.y) * ext.height)],
+                    ]
+                    if !config.quadOnly, let warped = applyPerspectiveCorrection(to: working, observation: obs) {
+                        working = warped
+                    }
+                } else {
+                    fputs("[WARN] No document boundary detected for \(imgURL.lastPathComponent), using full image\n", stderr)
+                }
+            }
+
+            if config.quadOnly {
+                renderedPages += 1
+                results.append(PageResult(
+                    index: idx,
+                    input: candidate.canonicalPath,
+                    file: imgURL.lastPathComponent,
+                    status: "ok",
+                    output: nil,
+                    message: "",
+                    detected: detected,
+                    method: method,
+                    confidence: confidence,
+                    width: origW,
+                    height: origH,
+                    quad: quadPixels
+                ))
+                return
+            }
+
+            working = applyEnhancement(to: working, mode: config.mode)
+
+            let pageSize = pageDimensions(option: config.pageSize, imageSize: working.extent.size, dpi: config.dpi)
+            let effectiveMargin = (config.pageSize == .fit) ? 0.0 : config.margin
+            let availW = max(10.0, pageSize.width - 2.0 * effectiveMargin)
+            let availH = max(10.0, pageSize.height - 2.0 * effectiveMargin)
+
+            if config.pageSize != .fit {
+                let maxPixW = availW * config.dpi / 72.0
+                let maxPixH = availH * config.dpi / 72.0
+                working = downscaleIfNeeded(working, maxPixelWidth: maxPixW, maxPixelHeight: maxPixH)
+            }
+
+            let jpegOpts: [CIImageRepresentationOption: Any] = [
+                kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: Double(config.jpegQuality) / 100.0
+            ]
+            let targetCS = (config.mode == .grayscale || config.mode == .bw)
+                ? CGColorSpaceCreateDeviceGray()
+                : colorSpace
+            guard let jpegData = ciContext.jpegRepresentation(of: working, colorSpace: targetCS, options: jpegOpts),
+                  let dataProvider = CGDataProvider(data: jpegData as CFData),
+                  let cgImg = CGImage(
+                      jpegDataProviderSource: dataProvider,
+                      decode: nil,
+                      shouldInterpolate: true,
+                      intent: .defaultIntent
+                  ) else {
+                let msg = "Failed to encode JPEG for \(imgURL.lastPathComponent)"
+                fputs("[WARN] \(msg)\n", stderr)
+                errorPages += 1
+                results.append(PageResult(
+                    index: idx,
+                    input: candidate.canonicalPath,
+                    file: imgURL.lastPathComponent,
+                    status: "error",
+                    output: nil,
+                    message: msg,
+                    detected: detected,
+                    method: method,
+                    confidence: confidence,
+                    width: 0,
+                    height: 0,
+                    quad: quadPixels
+                ))
+                return
+            }
+
+            let safeStem = sanitizeFileStem(imgURL.deletingPathExtension().lastPathComponent)
+            var emittedOutputPath: String? = nil
+
+            if let emitDir = emitDirURL {
+                let emitFile = emitDir.appendingPathComponent(String(format: "%04d_%@_scanned.jpg", idx + 1, safeStem))
+                do {
+                    try jpegData.write(to: emitFile, options: .atomic)
+                    emittedOutputPath = canonicalPath(emitFile)
+                } catch {
+                    let msg = "Failed to write emitted image for \(imgURL.lastPathComponent): \(error.localizedDescription)"
+                    fputs("[WARN] \(msg)\n", stderr)
+                    errorPages += 1
+                    results.append(PageResult(
+                        index: idx,
+                        input: candidate.canonicalPath,
+                        file: imgURL.lastPathComponent,
+                        status: "error",
+                        output: nil,
+                        message: msg,
+                        detected: detected,
+                        method: method,
+                        confidence: confidence,
+                        width: cgImg.width,
+                        height: cgImg.height,
+                        quad: quadPixels
+                    ))
+                    return
+                }
+            }
+
+            if let debugDir = debugDirURL {
+                let stem = imgURL.deletingPathExtension().lastPathComponent
+                let debugFile = debugDir.appendingPathComponent(String(format: "%02d_%@_scanned.jpg", idx + 1, stem))
+                try? jpegData.write(to: debugFile)
+                if emittedOutputPath == nil {
+                    emittedOutputPath = canonicalPath(debugFile)
+                }
+            }
+
+            if let pdfContext {
+                let imgW = Double(cgImg.width)
+                let imgH = Double(cgImg.height)
+                let drawScale = min(availW / imgW, availH / imgH)
+                let drawW = imgW * drawScale
+                let drawH = imgH * drawScale
+                let drawX = (pageSize.width - drawW) / 2.0
+                let drawY = (pageSize.height - drawH) / 2.0
+                let drawRect = CGRect(x: drawX, y: drawY, width: drawW, height: drawH)
+
+                var mediaBox = CGRect(origin: .zero, size: pageSize)
+                let pageInfo: [CFString: Any] = [kCGPDFContextMediaBox: NSData(bytes: &mediaBox, length: MemoryLayout<CGRect>.size)]
+                pdfContext.beginPDFPage(pageInfo as CFDictionary)
+                pdfContext.setFillColor(CGColor(gray: 1.0, alpha: 1.0))
+                pdfContext.fill(mediaBox)
+                pdfContext.draw(cgImg, in: drawRect)
+                pdfContext.endPDFPage()
+            }
+
+            renderedPages += 1
+            results.append(PageResult(
+                index: idx,
+                input: candidate.canonicalPath,
+                file: imgURL.lastPathComponent,
+                status: "ok",
+                output: emittedOutputPath,
+                message: "",
+                detected: detected,
+                method: method,
+                confidence: confidence,
+                width: cgImg.width,
+                height: cgImg.height,
+                quad: quadPixels
+            ))
         }
-
-        working = applyEnhancement(to: working, mode: config.mode)
-
-        let pageSize = pageDimensions(option: config.pageSize, imageSize: working.extent.size, dpi: config.dpi)
-        let effectiveMargin = (config.pageSize == .fit) ? 0.0 : config.margin
-        let availW = max(10.0, pageSize.width - 2.0 * effectiveMargin)
-        let availH = max(10.0, pageSize.height - 2.0 * effectiveMargin)
-
-        if config.pageSize != .fit {
-            let maxPixW = availW * config.dpi / 72.0
-            let maxPixH = availH * config.dpi / 72.0
-            working = downscaleIfNeeded(working, maxPixelWidth: maxPixW, maxPixelHeight: maxPixH)
-        }
-
-        let jpegOpts: [CIImageRepresentationOption: Any] = [
-            kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.88
-        ]
-        guard let jpegData = ciContext.jpegRepresentation(of: working, colorSpace: colorSpace, options: jpegOpts),
-              let dataProvider = CGDataProvider(data: jpegData as CFData),
-              let cgImg = CGImage(
-                  jpegDataProviderSource: dataProvider,
-                  decode: nil,
-                  shouldInterpolate: true,
-                  intent: .defaultIntent
-              ) else {
-            fputs("[WARN] Failed to encode JPEG for \(imgURL.lastPathComponent)\n", stderr)
-            continue
-        }
-
-        if let debugDir = debugDirURL {
-            let stem = imgURL.deletingPathExtension().lastPathComponent
-            let debugFile = debugDir.appendingPathComponent(String(format: "%02d_%@_scanned.jpg", idx + 1, stem))
-            try? jpegData.write(to: debugFile)
-        }
-
-        let imgW = Double(cgImg.width)
-        let imgH = Double(cgImg.height)
-        let drawScale = min(availW / imgW, availH / imgH)
-        let drawW = imgW * drawScale
-        let drawH = imgH * drawScale
-        let drawX = (pageSize.width - drawW) / 2.0
-        let drawY = (pageSize.height - drawH) / 2.0
-        let drawRect = CGRect(x: drawX, y: drawY, width: drawW, height: drawH)
-
-        var mediaBox = CGRect(origin: .zero, size: pageSize)
-        let pageInfo: [CFString: Any] = [kCGPDFContextMediaBox: NSData(bytes: &mediaBox, length: MemoryLayout<CGRect>.size)]
-        pdfContext.beginPDFPage(pageInfo as CFDictionary)
-        pdfContext.setFillColor(CGColor(gray: 1.0, alpha: 1.0))
-        pdfContext.fill(mediaBox)
-        pdfContext.draw(cgImg, in: drawRect)
-        pdfContext.endPDFPage()
-
-        renderedPages += 1
-        results.append(PageResult(
-            file: imgURL.lastPathComponent,
-            detected: detected,
-            method: method,
-            confidence: confidence,
-            width: cgImg.width,
-            height: cgImg.height
-        ))
     }
 
-    pdfContext.closePDF()
+    pdfContext?.closePDF()
 
-    if renderedPages == 0 {
-        try? fm.removeItem(at: outputURL)
-        fputs("[ERROR] Zero pages rendered.\n", stderr)
-        return 1
+    var fileSize: Int64 = 0
+    if let outputURL {
+        if renderedPages == 0 {
+            try? fm.removeItem(at: outputURL)
+        } else {
+            let attrs = try? fm.attributesOfItem(atPath: outputURL.path)
+            fileSize = (attrs?[.size] as? Int64) ?? 0
+        }
     }
 
-    let attrs = try? fm.attributesOfItem(atPath: outputURL.path)
-    let fileSize = (attrs?[.size] as? Int64) ?? 0
-    let summary = SummaryOutput(output: outputURL.path, pages: renderedPages, size_bytes: fileSize, results: results)
+    let summary = SummaryOutput(
+        engine: "pure_swift_vision",
+        output: renderedPages > 0 ? outputURL?.path : nil,
+        pages: renderedPages,
+        pages_error: errorPages,
+        size_bytes: fileSize,
+        results: results
+    )
+    writeManifest(summary, to: config.manifestPath)
 
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     if let jsonData = try? encoder.encode(summary), let jsonStr = String(data: jsonData, encoding: .utf8) {
         print(jsonStr)
+    }
+
+    if renderedPages == 0 {
+        fputs("[ERROR] Zero pages rendered.\n", stderr)
+        return 1
     }
 
     return 0

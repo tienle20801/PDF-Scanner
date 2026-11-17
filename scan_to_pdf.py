@@ -31,7 +31,7 @@ __all__ = [
 ]
 
 
-def process_image_to_scanned(image_path, enhance_mode="magic_color", auto_crop=False):
+def process_image_to_scanned(image_path, enhance_mode="auto_color", auto_crop=False):
     """Process a single image into a scanned PIL Image using the full batch_scanner pipeline."""
     img = load_image_bgr(image_path)
     if auto_crop:
@@ -50,9 +50,10 @@ def process_image_to_scanned(image_path, enhance_mode="magic_color", auto_crop=F
 def build_pdf(
     input_dir=".",
     output_pdf="scanned_document.pdf",
-    enhance_mode="magic_color",
+    enhance_mode="auto_color",
     auto_crop=False,
     dpi=200,
+    balance_symmetry=False,
 ):
     """Build a multi-page PDF from images/PDFs in input_dir using the upgraded pipeline."""
     out_path = output_pdf if os.path.isabs(output_pdf) else os.path.join(input_dir, output_pdf)
@@ -64,12 +65,12 @@ def build_pdf(
         dpi=dpi,
         multipoint_points=32,
         flatten_surface=True,
-        balance_symmetry=True,
+        balance_symmetry=balance_symmetry,
     )
 
 
 if __name__ == "__main__":
-    mode = sys.argv[1] if len(sys.argv) > 1 else "magic_color"
+    mode = sys.argv[1] if len(sys.argv) > 1 else "auto_color"
     target_dir = os.path.dirname(os.path.abspath(__file__))
     ok = build_pdf(input_dir=target_dir, output_pdf="Scanned_HD_Output.pdf", enhance_mode=mode)
     sys.exit(0 if ok else 1)

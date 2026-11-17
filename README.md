@@ -4,14 +4,14 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black.svg)](#)
 [![Zero Watermark](https://img.shields.io/badge/Watermark-None%20%2F%20Zero-brightgreen.svg)](#)
-[![DPI: 300 HD](https://img.shields.io/badge/Resolution-300%20DPI%20HD-cyan.svg)](#)
+[![Configurable DPI](https://img.shields.io/badge/Resolution-200%20DPI%20Default%20(125--300%2B)-cyan.svg)](#)
 
 <p align="center">
-  <img src="assets/svg/hero-banner.svg" alt="CamScanner MCP & HD Auto-Scanner Banner" width="100%">
+  <img src="assets/svg/hero-banner.svg" alt="PDF Scanner Studio & HD Engine Banner" width="100%">
 </p>
 
-> **The ultimate dual-engine document scanner for AI agents and power users.**  
-> Seamlessly orchestrate official **CamScanner MCP** in your AI workflows or run the **100% Free, Local, Lossless Python Engine** with zero watermarks, zero page caps, and pure white background illumination removal.
+> **A local-first document scanner for macOS and Python CLI, with optional remote MCP workflow integration.**  
+> Run the **100% Free, Offline Local Engine** (macOS Vision + OpenCV + Python) with zero watermarks and no artificial page limits, or optionally connect an external **CamScanner MCP** endpoint in AI agent clients. *(Not affiliated with or endorsed by CamScanner.)*
 
 ---
 
@@ -21,31 +21,12 @@
   <img src="assets/svg/feature-cards.svg" alt="Feature Cards Grid" width="100%">
 </p>
 
-- 🚀 **Zero Watermark Forever:** Never deal with the intrusive *"Scanned with CamScanner"* watermark on your PDF exports.
-- 🎨 **CamScanner Magic Color Algorithm + Stroke Compensation (`compensate_strokes_and_lines`):** Morphological illumination estimation (`dilate + medianBlur`) turns dull gray paper into crisp `#FFFFFF`, while horizontal/vertical morphological line repair restores `1–4 px` breaks on thin handwriting and table grids before gamma LUT remapping.
-- 📐 **Hybrid Vision + OpenCV Perspective & 128-Point Edge Cleaning (`multipoint_border_mask_clean`):** Combines macOS Vision `VNDetectDocumentSegmentationRequest` (with OpenCV contour fallback) and 128-point curved-border masking with local interior paper propagation (`local_bg`) to erase curved desk/table bleeds without clipping gutter text.
-- 🧭 **2D Polynomial Surface Flattening (`flatten_document_surface`) & Symmetric Margins (`balance_page_symmetry`):** Fits a regularized Ridge 2D displacement field over ruling/text lines (with padded remapping) to uncurl warped sheets, then centers page content with balanced 4-side margins.
-- 🤖 **Model Context Protocol (MCP) Native:** Connects to **Claude Desktop**, **Kilo CLI**, **Cursor**, and any MCP client via remote Streamable HTTP (`https://ai-tools.camscanner.com/mcp`).
-- ⚡ **Lightning Fast & 100% Offline:** Processes batch camera pages locally on your CPU with configurable DPI compression (`125`–`300 DPI`) for compact or lossless PDFs.
-- 📦 **Multi-Page Batch Compiler:** Ingests JPG, PNG, WebP, HEIC, or scanned PDFs in natural page order and compiles them into a clean single PDF.
-
----
-
-## 📊 Feature Comparison Matrix
-
-<p align="center">
-  <img src="assets/svg/feature-comparison.svg" alt="Feature Comparison: CamScanner Free App vs This Engine" width="100%">
-</p>
-
-| Feature | CamScanner Free App | CamScanner Premium ($49.99/yr) | **This Open-Source Engine** |
-| :--- | :---: | :---: | :---: |
-| **Price** | Free (Ad-supported) | $49.99 / year | **100% Free & Open Source (MIT)** |
-| **Watermark** | ❌ Watermarked ("Scanned with...") | ✅ Removed | **✅ Zero Watermark (Always Clean)** |
-| **Resolution** | ⚠️ Compressed / Downscaled | ✅ Full HD | **✅ Lossless 300 DPI High-Definition** |
-| **Batch Page Limit** | ⚠️ Capped per document | ✅ Unlimited | **✅ Unlimited (1 to 1000+ Pages)** |
-| **Privacy & Security** | ❌ Cloud Upload Required | ❌ Cloud Upload Required | **✅ 100% Offline Local Processing** |
-| **AI Agent Integration** | ⚠️ OAuth / Tier Dependent | ⚠️ OAuth / Tier Dependent | **✅ Direct MCP + Python Scripting** |
-| **Processing Speed** | 🐢 45–60s (Network dependent) | 🐢 Cloud upload delays | **⚡ ~3.2 seconds for 20 Pages** |
+- 🚀 **Zero Watermark:** Exports clean multi-page PDFs without promotional stamps or overlays.
+- 🎨 **Auto Color Algorithm + White Balance + Stroke Compensation:** Neutralizes warm/cool/tinted paper casts via inner low-saturation paper white balance (`_estimate_global_wb_gain`, `[0.70, 1.45]`), estimates uneven illumination at bounded `<= 720 px` resolution with dark-block tapering (`_compute_background_ratio`), repairs `1–4 px` table breaks using real local stroke darkness (`compensate_strokes_and_lines` + adaptive ink threshold), applies `_MAGIC_LUT`, and sharpens edges with `_SHARPEN_KERNEL`.
+- 📐 **Hybrid Vision + OpenCV Perspective & 128-Point Edge Cleaning:** Combines macOS Vision `VNDetectDocumentSegmentationRequest` with OpenCV HSV+Otsu + Canny white-on-white edge fallback (`detect_and_crop_with_info`, centroid polar corner ordering, solidity guard, relative size minimum) and 128-point curved-border cleaning (`multipoint_border_mask_clean`).
+- 🧭 **Deskew + Quality-Gated 2D Surface Flattening & Optional Symmetry:** Automatically estimates global tilt (`0.3°–8.0°`), fits a regularized 2D surface (`max_shift = 1.8% min(h, w)`) and skips `cv2.remap` whenever line-straightness RMS fails to improve (`>= 15%` gain) or vertical coverage is sparse. Symmetric 4-side margin centering (`balance_page_symmetry`) is **off by default** (`--symmetry` to enable) so document layout stays anchored unless explicitly centered.
+- 📦 **Multi-Format & Multi-Page Batch Compiler:** Ingests JPG, PNG, WebP, BMP, TIFF (including multi-page TIFF in CLI), HEIC/HEIF, and scanned PDFs in natural page order and compiles them into exact `A4`, `Letter`, or `Fit` PDFs (`pypdf` `/DCTDecode` in CLI, `CGPDFContext` in the macOS app).
+- 🔒 **100% Offline Local Engine (Optional Cloud MCP):** The local CLI and macOS app never upload documents to the cloud. If you manually configure the remote CamScanner MCP server (`https://ai-tools.camscanner.com/mcp`) in an AI assistant, documents sent via MCP are processed on that third-party cloud service.
 
 ---
 
@@ -55,7 +36,7 @@
   <img src="assets/svg/pipeline-steps.svg" alt="5-Step Document Scanner Pipeline" width="100%">
 </p>
 
-For full mathematical derivations, see our [Algorithm Deep Dive](docs/ALGORITHM_DEEP_DIVE.md).
+For full mathematical derivations and exact implementation parameters, see [docs/ALGORITHM_DEEP_DIVE.md](docs/ALGORITHM_DEEP_DIVE.md).
 
 ---
 
@@ -71,47 +52,54 @@ For full mathematical derivations, see our [Algorithm Deep Dive](docs/ALGORITHM_
 
 ### 1. Prerequisites & Installation
 
+**Python CLI (`scripts/batch_scanner.py`):**
+- Python `3.9+`
+- Dependencies pinned in [requirements.txt](requirements.txt) (including `pillow-heif` for `.heic`/`.heif` images)
+
 ```bash
 # Clone the repository
 git clone https://github.com/tienle20801/PDF-Scanner.git
 cd PDF-Scanner
 
-# Install Python requirements
-pip install opencv-python pillow numpy pypdf
+# Create a virtual environment and install Python dependencies
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
+
+**macOS Desktop App (`PDF Scanner.app`) requirements:**
+- macOS `14.0+` (Apple Silicon `arm64`)
+- **Prebuilt `.app` / `.dmg`:** Runs standalone out-of-the-box (bundles relocatable Python 3.10 + OpenCV dependencies and precompiled `bin/doc_scanner`)
+- **Running from source (`./macos_app/build_app.sh`):** Xcode Command Line Tools (`xcode-select --install`) and `.venv` with [requirements.txt](requirements.txt) installed (for `Hybrid OpenCV + Vision` bundling)
 
 ### 2. Batch Scan Mobile Photos or Scanned PDFs into One HD PDF
 
-Place your raw photos (`.jpg`, `.png`, `.webp`, `.heic`) or scanned `.pdf` files in a folder, then run:
+Place your raw photos (`.jpg`, `.png`, `.webp`, `.bmp`, `.tif`/`.tiff`, `.heic`) or scanned `.pdf` files in a folder, then run:
 
 ```bash
-./scan.sh "path/to/raw_photos" "output/Scanned_Document_HD.pdf" --mode magic_color --dpi 160
+./scan.sh "path/to/raw_photos" "output/Scanned_Document_HD.pdf" --mode auto_color --dpi 200
 ```
 
 Available CLI options (`python scripts/batch_scanner.py --help`):
-- `--mode magic_color|clean|bw|grayscale|original` (default: `magic_color`)
-- `--crop-engine auto|vision|opencv` (default: `auto` — uses macOS Vision `doc_scanner.swift` when available, otherwise OpenCV contour detection)
+- `--mode auto_color|clean|bw|grayscale|original` (default: `auto_color`; `magic_color` is accepted as a backward-compatible alias)
+- `--crop-engine auto|vision|opencv` (default: `auto` — uses macOS Vision `doc_scanner.swift` when available, otherwise OpenCV HSV+Otsu contour detection)
 - `--multipoint-points <int>` (default: `32` = `128` edge control points; `0` to disable)
-- `--page-size a4|letter|fit` (default: `a4`), `--dpi <int>` (default: `200`), `--margin <pts>` (default: `20.0`)
-- `--no-crop`, `--no-flatten`, `--no-symmetry`, `--save-debug <dir>`
+- `--page-size a4|letter|fit` (default: `a4`), `--dpi <int>` (default: `200`, downscales large pages only; does not upscale), `--margin <pts>` (default: `20.0`), `--jpeg-quality <1..100>` (default: `86`)
+- `--workers <int>` (default: `1`, page-level streaming; set `>1` for multiprocessing), `--no-crop`, `--no-flatten`, `--symmetry` / `--no-symmetry` (symmetry off by default), `--worker-stdio`, `--emit-dir <dir>`, `--manifest <file.json>`, `--save-debug <dir>`
 
-The upgraded 5-stage engine will automatically:
-1. Detect quadrilateral page contours (`macOS Vision` / OpenCV fallback) and rectify perspective.
-2. Clean curved desk/table bleeds around the page perimeter using **128-point border masking (`multipoint_border_mask_clean`)** with local interior paper propagation.
-3. Estimate uneven illumination (`dilate + medianBlur`), repair broken table rulings and thin strokes (**`compensate_strokes_and_lines`**), and apply the calibrated **Magic Color** LUT + Laplacian sharpening.
-4. Fit a Ridge 2D polynomial warp over extracted ruling/text lines (**`flatten_document_surface`**) with padded remapping to uncurl distorted pages.
-5. Center page content symmetrically with balanced margins (**`balance_page_symmetry`**) and export a compact, non-watermarked PDF!
+Independent vector-preserving PDF compression CLI ([scripts/pdf_compressor.py](scripts/pdf_compressor.py)):
+```bash
+.venv/bin/python scripts/pdf_compressor.py input.pdf output_compressed.pdf --dpi 150 --target-mb 10.0 --mode original
+```
+This keeps pure vector/text pages and original page `MediaBox` sizes untouched while re-encoding embedded raster XObjects via a binary-search quality/DPI loop until reaching the target size budget (or reporting the tightest readable limit).
+
+Color and `grayscale` pages are JPEG-encoded once at the end (`quality=86` default in Python CLI, `88` in `doc_scanner.swift`) and embedded as `/DCTDecode` (`/DeviceRGB` or `/DeviceGray`); `bw` pages in Python CLI are stored as 1-bit PNGs and embedded as 1-bit `/FlateDecode` (`/DeviceGray`) inside exact `A4`, `Letter`, or `Fit` `MediaBox` PDFs.
+
+*Streaming & Worker execution:* `convert_folder_to_hd_pdf` processes pages in streaming mode (`workers=1`) or isolated per-page subprocesses (`--workers N`), keeping isolated 20-page 12MP CLI peak RSS around `433.6 MiB`. Live UI previews reuse a single warm `--worker-stdio` Python process to avoid repeated OpenCV import latency.
 
 ### 3. macOS Native Desktop App (`PDF Scanner.app`)
 
-Prefer a lightweight visual UI over typing CLI commands? Download `PDF-Scanner.dmg` from Releases (drag **PDF Scanner.app** into **Applications**) or open `PDF Scanner.app` directly from the repository root:
-
-- **Drop-First Contextual Studio:** Clean dropzone adapts to `Scan`, `Ghép 2 mặt` (Pair Front + Back), `Tách PDF` (Split), `Gộp / Xoay` (Merge & Rotate), and `Nén nhẹ` (Compress); preview and parameter drawers appear automatically when files are loaded.
-- **Auto Reading Orientation & Natural Sort A→Z:** Automatically sorts multi-file drops naturally (`1, 2, 3... 10`), detects text reading orientation (`0° / 90° / 180° / 270°`) via Apple Vision, and applies `Magic Color` in the background without blocking UI interaction.
-- **Interactive Before ↔ After Split Slider & Zoom:** Drag the split curtain directly across the document (`Original` ↔ `Scanned`) with Pinch-to-Zoom and slider zoom (`50%`–`400%`), or inspect source/exported PDFs with the built-in `PDFKit` viewer.
-- **Full Pipeline Controls & Batch Naming Rules:** Switch between `Hybrid OpenCV + Vision` and `Pure Swift Vision`, reuse scanned page caches on export, set pattern-based naming rules (`TaiLieu_xx`, `Ngay_xx.11`) for paired exports, and protect existing files with overwrite checkpoints.
-
-To rebuild `PDF Scanner.app` and `PDF-Scanner.dmg` from source (`macos_app/Sources/*.swift`):
+To build a self-contained `PDF Scanner.app` (`arm64` macOS 14.0+, bundling relocatable Python 3.10 + OpenCV dependencies and precompiled `bin/doc_scanner`) and optional `PDF-Scanner.dmg`:
 
 ```bash
 ./macos_app/build_app.sh
@@ -119,11 +107,33 @@ To rebuild `PDF Scanner.app` and `PDF-Scanner.dmg` from source (`macos_app/Sourc
 open "PDF Scanner.app"
 ```
 
+Key UI capabilities:
+- **Drop-First Contextual Studio:** Adapts to `Scan`, `Ghép 2 mặt` (Pair Front + Back), `Tách PDF` (Split), `Gộp / Xoay` (Merge & Rotate), and `Nén nhẹ` (vector-preserving PDF compression with target-size loop `≤ 10 MB / 5 MB / 2 MB` and `Original` mode default).
+- **Auto Reading Orientation & Optional Invisible OCR (`vi-VT` + `en-US`):** Sorts multi-file drops naturally (`1, 2, 3... 10`), detects text reading orientation (`0° / 90° / 180° / 270°`), and optionally embeds a searchable/selectable invisible CoreText PDF text layer (`enableOCR`, off by default for maximum speed) sharing OCR observations when geometry matches.
+- **Interactive Before ↔ After Split Slider & Startup Preflight:** Drag the split curtain directly across `Original` ↔ `Scanned` with Pinch-to-Zoom and slider zoom (`50%`–`400%`), inspect PDFs with `PDFKit`, and run an automatic Python/OpenCV + Vision preflight check on startup with one-click fallback to `Pure Swift Vision`.
+- **Honest Engine Modes & Batch Naming Rules:** Switch between `Hybrid OpenCV + Vision` and `Pure Swift Vision` (`Clean`, `Grayscale`, `B&W`, `Original` natively in CoreImage/Vision, hiding Hybrid-only geometry options when `Pure Swift Vision` is active), reuse cached pages on export, and apply pattern naming (`TaiLieu_xx`, `Ngay_xx.11`).
+
 ---
 
-## 🤖 Model Context Protocol (MCP) Setup
+## 📈 Measured Benchmark (Apple Silicon)
 
-Connect CamScanner MCP tools directly to your AI assistants (Claude, Cursor, Kilo):
+Measured reproducibly with [scripts/benchmark.py](scripts/benchmark.py) on synthetic 12MP (`4032×3024`) documents:
+
+- **Hardware & Software:** Apple M1 (`arm64`, 8 cores, 8 GB RAM), `macOS 27.2` (`Darwin 27.2.0`), Python `3.10.22`, OpenCV `5.0.0`, NumPy `2.2.6`
+- **Command:** `.venv/bin/python scripts/benchmark.py --pages 20 --runs 5 --dpi 200`
+
+| Benchmark Workload | Measured Result | Notes |
+|---|---:|---|
+| **Single 12MP Page — 6-Stage Pipeline (`A4 @ 200 DPI`, OpenCV)** | **336.4 ms** (median) | `detect_and_crop` 11.2 ms, `downscale` 15.7 ms, `multipoint` 67.2 ms, `enhance` 79.7 ms, `flatten` 85.7 ms (quality-gated), `symmetry` 76.8 ms |
+| **Single 12MP Page — `enhance_image_bgr` on full 12MP** | **377.4 ms** (median) | Includes global paper WB + downsampled (`<= 720 px`) background estimation |
+| **20-Page 12MP Batch (`workers=1`, `A4 @ 200 DPI`, OpenCV)** | **6.13 s** (0.31 s/page) | Output PDF: `2.78 MiB` • Standalone CLI (`/usr/bin/time -l`): `6.49 s`, `433.6 MiB` RSS |
+| **20-Page 12MP Batch (`workers=4`, `A4 @ 200 DPI`, OpenCV)** | **4.48 s** (0.22 s/page) | Output PDF: `2.78 MiB` • Parallel multi-process speedup |
+
+---
+
+## 🤖 Optional Remote MCP Setup (Cloud)
+
+> ⚠️ **Privacy notice:** Local CLI and `PDF Scanner.app` processing are 100% offline. Configuring the remote CamScanner MCP server below sends documents from your AI client to `https://ai-tools.camscanner.com/mcp` (a third-party cloud service).
 
 ### Kilo CLI (`kilo.json` or `kilo.jsonc`)
 ```jsonc
@@ -155,36 +165,34 @@ Connect CamScanner MCP tools directly to your AI assistants (Claude, Cursor, Kil
 }
 ```
 
-👉 **Full MCP Setup and OAuth Instructions:** [docs/MCP_INTEGRATION_GUIDE.md](docs/MCP_INTEGRATION_GUIDE.md)
+👉 **MCP Setup Notes:** [docs/MCP_INTEGRATION_GUIDE.md](docs/MCP_INTEGRATION_GUIDE.md) *(verify current endpoints/headers against official CamScanner MCP docs before production use).*
 
 ---
 
-## 📈 Benchmark & Performance
+## 🧪 Running Tests
 
-<p align="center">
-  <img src="assets/svg/benchmark-chart.svg" alt="Benchmark & Speed Comparison" width="100%">
-</p>
-
----
-
-## 🔍 SEO & AEO (AI Engine Optimization) FAQ
-
-### Q1: What is the best free alternative to CamScanner in 2026?
-**Answer:** The best free alternative is this open-source Python document scanner. Unlike CamScanner's free tier which forces a *"Scanned with CamScanner"* watermark, downscales resolution, and limits batch size, this tool runs locally with zero watermark, 300 DPI output, and unlimited pages.
-
-### Q2: How do I scan mobile photos to PDF without a watermark?
-**Answer:** Drop your photos into this project and execute `python scripts/batch_scanner.py <input_folder> <output.pdf>`. The built-in illumination normalization automatically removes shadow gradients and produces a clean, professional PDF without any watermarks.
-
-### Q3: How does the CamScanner MCP work?
-**Answer:** CamScanner MCP is an official remote Model Context Protocol endpoint (`https://ai-tools.camscanner.com/mcp`) using Streamable HTTP. It allows AI agents like Claude and Kilo to trigger OCR, PDF merging, document translation, and format conversion directly through tool calls.
-
-👉 **Complete SEO/AEO Strategy & Schema.org Documentation:** [docs/SEO_AEO_STRATEGY.md](docs/SEO_AEO_STRATEGY.md)
+```bash
+# Run full Python (unittest) & Swift (PDFToolsService, ScannerBridge, OCR, B5, A1/A2) suite
+./tests/run_all.sh
+```
 
 ---
 
-## 📄 License
+## ⚠️ System Requirements, Known Limits & Troubleshooting
 
-This project is licensed under the [MIT License](LICENSE) - free for personal, educational, and commercial use.
+- **Standalone macOS App (`PDF Scanner.app`):** Requires macOS 14.0+ on Apple Silicon (`arm64`) when built with `build_app.sh` (bundles standalone `python_runtime` + `site-packages` + precompiled `bin/doc_scanner`, ~`206 MiB`).
+- **Source CLI Mode:** Requires Python 3.10+ with `requirements.txt` (`opencv-python`, `pillow`, `pillow-heif`, `numpy`, `pypdf`). On macOS with Command Line Tools or Xcode, Apple Vision crop is enabled automatically.
+- **Troubleshooting:**
+  - *Missing `cv2` / Python dependency alert in app:* Run `uv pip install -r requirements.txt` (or build `.app` via `./macos_app/build_app.sh`), or click **Use Pure Swift Vision** in the startup banner to run dependency-free via macOS Vision + CoreImage.
+  - *Python CLI skips a PDF page (`vector/text without embedded raster images`):* `scripts/batch_scanner.py` only extracts raster images from PDF pages. Use `PDF Scanner.app` (renders via `PDFKit` at 260 DPI) or pre-rasterize vector PDFs before CLI processing.
+- **Known Limits:** Zero-contrast white-on-white capture without shadows/desk edges, severe glossy specular reflections, deep 3D book-spine curvature beyond the 1.8% displacement clamp, and heavily textured tablecloths remain challenging without manual corner framing.
+
+---
+
+## 📄 License & Dependencies
+
+This project is licensed under the [MIT License](LICENSE). Bundled/required third-party components:
+- `OpenCV` (Apache-2.0), `NumPy` (BSD-3-Clause), `Pillow` (HPND), `pillow-heif` (LGPL/Apache-2.0), `pypdf` (BSD-3-Clause), and macOS system frameworks (`AppKit`, `CoreImage`, `CoreText`, `PDFKit`, `Vision`).
 
 ---
 

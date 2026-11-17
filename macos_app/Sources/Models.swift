@@ -24,7 +24,7 @@ enum PipelineEngine: String, CaseIterable, Identifiable {
     var subtitle: String {
         switch self {
         case .hybridOpenCV:
-            return "Đầy đủ Magic Color, Crop Đa Điểm 128 đỉnh, Nắn phẳng 3D & Cân lề"
+            return "Đầy đủ Auto Color, Crop Đa Điểm 128 đỉnh, Nắn phẳng 3D & Cân lề"
         case .pureSwiftVision:
             return "Thuần macOS Vision + CoreImage (siêu nhanh, không cần Python)"
         }
@@ -32,7 +32,7 @@ enum PipelineEngine: String, CaseIterable, Identifiable {
 }
 
 enum EnhanceMode: String, CaseIterable, Identifiable {
-    case magicColor = "magic_color"
+    case autoColor = "auto_color"
     case clean = "clean"
     case bw = "bw"
     case grayscale = "grayscale"
@@ -42,7 +42,7 @@ enum EnhanceMode: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .magicColor: return "Magic Color"
+        case .autoColor: return "Auto Color"
         case .clean: return "Clean"
         case .bw: return "B&W"
         case .grayscale: return "Grayscale"
@@ -52,8 +52,8 @@ enum EnhanceMode: String, CaseIterable, Identifiable {
 
     var descriptionText: String {
         switch self {
-        case .magicColor:
-            return "Chuẩn PDF Scanner: xóa bóng đèn/tay, tẩy giấy trắng #FFFFFF, bù nét chữ mảnh & kẻ bảng"
+        case .autoColor:
+            return "Chuẩn PDF Scanner: xóa bóng đèn/tay, làm sáng nền giấy, bù nét chữ mảnh & kẻ bảng"
         case .clean:
             return "Nâng sáng vùng tối nhẹ nhàng, khử bóng vừa phải, giữ màu sắc tự nhiên"
         case .bw:
@@ -67,9 +67,20 @@ enum EnhanceMode: String, CaseIterable, Identifiable {
 
     var swiftVisionFallbackMode: String {
         switch self {
-        case .magicColor, .grayscale, .clean: return "clean"
+        case .autoColor, .clean: return "clean"
+        case .grayscale: return "grayscale"
         case .bw: return "bw"
         case .original: return "original"
+        }
+    }
+
+    var pureSwiftEffectiveTitle: String {
+        switch self {
+        case .autoColor: return "Clean (CoreImage)"
+        case .clean: return "Clean"
+        case .grayscale: return "Grayscale"
+        case .bw: return "B&W"
+        case .original: return "Original"
         }
     }
 }
@@ -176,7 +187,7 @@ enum StudioTask: String, CaseIterable, Identifiable {
 
     var dropzoneSubtitle: String {
         switch self {
-        case .scan: return "Hỗ trợ JPG, PNG, HEIC, WebP, TIFF và PDF • Tự sắp xếp A→Z & làm nét Magic Color"
+        case .scan: return "Hỗ trợ JPG, PNG, HEIC, WebP, TIFF và PDF • Tự sắp xếp A→Z & làm nét Auto Color"
         case .pair: return "Tự động kẹp trang mặt sau vào sau mỗi trang mặt trước"
         case .split: return "Tách từng trang lẻ hoặc trích xuất theo dải trang (vd: 1-3, 5)"
         case .mergeRotate: return "Giữ nguyên chất lượng vector gốc của tài liệu PDF"
@@ -204,16 +215,47 @@ enum StudioTask: String, CaseIterable, Identifiable {
 
 struct ScanSettings: Equatable {
     var engine: PipelineEngine = .hybridOpenCV
-    var mode: EnhanceMode = .magicColor
+    var mode: EnhanceMode = .autoColor
     var autoCrop: Bool = true
     var cropEngine: CropEngine = .auto
     var multipointPoints: Int = 32
     var flattenSurface: Bool = true
-    var balanceSymmetry: Bool = true
+    var balanceSymmetry: Bool = false
     var minConfidence: Double = 0.45
+    var jpegQuality: Int = AppConstants.defaultJPEGQuality
     var pageSize: PageSizePreset = .a4
-    var dpi: Int = 200
-    var margin: Double = 20.0
+    var dpi: Int = AppConstants.defaultDPI
+    var margin: Double = AppConstants.defaultMarginPts
+    /// Q9: Optional invisible Vision OCR text layer (off by default to prioritize speed; does not alter enhanced pixels).
+    var enableOCR: Bool = false
+
+    /// Signature of settings that affect enhanced image pixels (excludes pure PDF layout & OCR controls).
+    var imageProcessingSignature: String {
+        let resBucket = (pageSize == .fit) ? "fit" : "dpi_\(dpi)"
+        return [
+            engine.rawValue,
+            mode.rawValue,
+            autoCrop ? "crop1" : "crop0",
+            cropEngine.rawValue,
+            "mp\(multipointPoints)",
+            flattenSurface ? "flat1" : "flat0",
+            balanceSymmetry ? "sym1" : "sym0",
+            String(format: "mc%.2f", minConfidence),
+            "jq\(jpegQuality)",
+            resBucket
+        ].joined(separator: "|")
+    }
+}
+
+struct PreflightReport: Equatable {
+    let isHealthy: Bool
+    let usingBundledPython: Bool
+    let pythonPath: String
+    let pythonVersion: String
+    let opencvVersion: String
+    let visionHelperAvailable: Bool
+    let summary: String
+    let remediation: String?
 }
 
 struct InputPageItem: Identifiable, Equatable {
@@ -227,6 +269,8 @@ struct InputPageItem: Identifiable, Equatable {
     var thumbnail: NSImage?
     var originalPreview: NSImage?
     var processedPreviewURL: URL?
+    var processedCacheKey: String?
+    var scanError: String?
 
     init(
         id: UUID = UUID(),
@@ -238,7 +282,9 @@ struct InputPageItem: Identifiable, Equatable {
         orientationChecked: Bool = false,
         thumbnail: NSImage? = nil,
         originalPreview: NSImage? = nil,
-        processedPreviewURL: URL? = nil
+        processedPreviewURL: URL? = nil,
+        processedCacheKey: String? = nil,
+        scanError: String? = nil
     ) {
         self.id = id
         self.sourceURL = sourceURL
@@ -250,6 +296,8 @@ struct InputPageItem: Identifiable, Equatable {
         self.thumbnail = thumbnail
         self.originalPreview = originalPreview
         self.processedPreviewURL = processedPreviewURL
+        self.processedCacheKey = processedCacheKey
+        self.scanError = scanError
     }
 
     static func == (lhs: InputPageItem, rhs: InputPageItem) -> Bool {
@@ -260,7 +308,9 @@ struct InputPageItem: Identifiable, Equatable {
         lhs.sourceFolderName == rhs.sourceFolderName &&
         lhs.rotationDegrees == rhs.rotationDegrees &&
         lhs.orientationChecked == rhs.orientationChecked &&
-        lhs.processedPreviewURL == rhs.processedPreviewURL
+        lhs.processedPreviewURL == rhs.processedPreviewURL &&
+        lhs.processedCacheKey == rhs.processedCacheKey &&
+        lhs.scanError == rhs.scanError
     }
 }
 
@@ -269,6 +319,12 @@ struct CompressionResult {
     let beforeBytes: Int64
     let afterBytes: Int64
     let pageCount: Int
+    var vectorPagesPreserved: Int = 0
+    var imagePagesRecompressed: Int = 0
+    var targetAchieved: Bool = true
+    var usedDPI: Int = AppConstants.defaultCompressDPI
+    var usedQuality: Int = AppConstants.defaultCompressJPEGQuality
+    var detailsMessage: String = ""
 
     var savedPercent: Double {
         guard beforeBytes > 0 else { return 0 }

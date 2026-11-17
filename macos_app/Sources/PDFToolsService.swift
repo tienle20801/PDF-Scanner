@@ -1,5 +1,7 @@
 import AppKit
 import CoreImage
+import CoreText
+import CryptoKit
 import Foundation
 import ImageIO
 import PDFKit
@@ -163,22 +165,26 @@ enum PDFToolsService {
         return items
     }
 
-    static func makeImageThumbnail(url: URL, maxSide: CGFloat = 220) -> NSImage? {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+    static func makeImageThumbnail(url: URL, maxSide: CGFloat = AppConstants.thumbnailMaxSide) -> NSImage? {
+        guard let cgThumb = makeDownscaledCGImage(url: url, maxSide: maxSide) else {
             return NSImage(contentsOf: url)
+        }
+        return NSImage(cgImage: cgThumb, size: NSSize(width: cgThumb.width, height: cgThumb.height))
+    }
+
+    static func makeDownscaledCGImage(url: URL, maxSide: CGFloat) -> CGImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+            return nil
         }
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: maxSide
         ]
-        guard let cgThumb = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
-            return NSImage(contentsOf: url)
-        }
-        return NSImage(cgImage: cgThumb, size: NSSize(width: cgThumb.width, height: cgThumb.height))
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
     }
 
-    static func loadDisplayImage(for item: InputPageItem, maxSide: CGFloat = 1800) -> NSImage? {
+    static func loadDisplayImage(for item: InputPageItem, maxSide: CGFloat = AppConstants.previewMaxSide) -> NSImage? {
         let baseImage: NSImage?
         if let pageIdx = item.pageIndexInPDF {
             guard let doc = PDFDocument(url: item.sourceURL),
@@ -226,137 +232,248 @@ enum PDFToolsService {
         }
     }
 
+    struct OCRTextLine: Equatable {
+        let text: String
+        let boundingBox: CGRect
+    }
+
     private static let orientationQueue = DispatchQueue(
         label: "com.pdfscanner.app.orientation",
-        qos: .userInitiated
+        qos: .userInitiated,
+        attributes: .concurrent
     )
-    private static let orientationLock = NSLock()
+    private static let ocrCacheLock = NSLock()
+    private static var ocrCacheByKey: [String: [OCRTextLine]] = [:]
 
-    static func detectReadingOrientationDegreesAsync(for item: InputPageItem) async -> Int {
+    private static let resolvedOCRLanguages: [String] = {
+        let req = VNRecognizeTextRequest()
+        let supported = Set((try? req.supportedRecognitionLanguages()) ?? ["en-US"])
+        let chosen = AppConstants.ocrPreferredLanguages.filter { supported.contains($0) }
+        return chosen.isEmpty ? ["en-US"] : chosen
+    }()
+
+    static func ocrCacheKey(for url: URL, pageIndex: Int? = nil, rotationDegrees: Int = 0) -> String {
+        let deg = ((rotationDegrees % 360) + 360) % 360
+        let mtimeMs = fileModificationTimestamp(for: url)
+        let pageToken = pageIndex.map(String.init) ?? "img"
+        return "\(url.standardizedFileURL.resolvingSymlinksInPath().path)::\(pageToken)::\(mtimeMs)::\(deg)"
+    }
+
+    static func cachedOCRTextLines(forKey key: String) -> [OCRTextLine]? {
+        ocrCacheLock.lock()
+        defer { ocrCacheLock.unlock() }
+        return ocrCacheByKey[key]
+    }
+
+    private static func storeOCRTextLines(_ lines: [OCRTextLine], forKey key: String) {
+        ocrCacheLock.lock()
+        defer { ocrCacheLock.unlock() }
+        if ocrCacheByKey.count > 200 {
+            ocrCacheByKey.removeAll(keepingCapacity: true)
+        }
+        ocrCacheByKey[key] = lines
+    }
+
+    static func clearOCRCache() {
+        ocrCacheLock.lock()
+        ocrCacheByKey.removeAll()
+        ocrCacheLock.unlock()
+    }
+
+    private static func loadDirectCGImageForOCR(for item: InputPageItem, maxSide: CGFloat) -> CGImage? {
+        let deg = ((item.rotationDegrees % 360) + 360) % 360
+        if let pageIdx = item.pageIndexInPDF {
+            guard let doc = PDFDocument(url: item.sourceURL),
+                  let page = doc.page(at: pageIdx) else { return nil }
+            let box = page.bounds(for: .cropBox)
+            let longest = max(box.width, box.height, 1.0)
+            let targetDPI = max(72.0, min(200.0, (maxSide / longest) * 72.0))
+            return try? renderPDFPageToCGImage(page: page, dpi: targetDPI, extraClockwiseRotation: deg)
+        }
+        guard let cg = makeDownscaledCGImage(url: item.sourceURL, maxSide: maxSide) else {
+            return nil
+        }
+        if deg == 0 { return cg }
+        let ci = applyClockwiseRotation(CIImage(cgImage: cg), degrees: deg)
+        let norm = ci.transformed(by: CGAffineTransform(translationX: -ci.extent.minX, y: -ci.extent.minY))
+        return ciContext.createCGImage(norm, from: norm.extent) ?? cg
+    }
+
+    static func recognizeTextLines(
+        in cgImage: CGImage,
+        recognitionLevel: VNRequestTextRecognitionLevel = .accurate,
+        cacheKey: String? = nil
+    ) -> [OCRTextLine] {
+        if let cacheKey, let cached = cachedOCRTextLines(forKey: cacheKey) {
+            return cached
+        }
+        let req = VNRecognizeTextRequest()
+        req.recognitionLevel = recognitionLevel
+        req.usesLanguageCorrection = true
+        req.recognitionLanguages = resolvedOCRLanguages
+
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        do {
+            try handler.perform([req])
+        } catch {
+            return []
+        }
+
+        var lines: [OCRTextLine] = []
+        for obs in (req.results ?? []) {
+            guard let top = obs.topCandidates(1).first else { continue }
+            let str = top.string.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !str.isEmpty else { continue }
+            lines.append(OCRTextLine(text: str, boundingBox: obs.boundingBox))
+        }
+        if let cacheKey, recognitionLevel == .accurate {
+            storeOCRTextLines(lines, forKey: cacheKey)
+        }
+        return lines
+    }
+
+    static func detectReadingOrientationDegreesAsync(
+        for item: InputPageItem,
+        cacheAccurateOCR: Bool = false
+    ) async -> Int {
         await withCheckedContinuation { continuation in
             orientationQueue.async {
-                let result = detectReadingOrientationDegrees(for: item)
+                let result = detectReadingOrientationDegrees(for: item, cacheAccurateOCR: cacheAccurateOCR)
                 continuation.resume(returning: result)
             }
         }
     }
 
     /// Detects the clockwise rotation (0, 90, 180, or 270 degrees) needed to make document text upright.
-    static func detectReadingOrientationDegrees(for item: InputPageItem) -> Int {
-        orientationLock.lock()
-        defer { orientationLock.unlock() }
-        guard let img = loadDisplayImage(for: item, maxSide: 2000),
-              let tiff = img.tiffRepresentation,
-              let ci = CIImage(data: tiff) else {
+    static func detectReadingOrientationDegrees(
+        for item: InputPageItem,
+        cacheAccurateOCR: Bool = false
+    ) -> Int {
+        guard let directCG = loadDirectCGImageForOCR(for: item, maxSide: AppConstants.ocrOrientationMaxSide) else {
             return 0
         }
-        return detectReadingOrientationDegrees(from: ci)
+        let finalRotBase = ((item.rotationDegrees % 360) + 360) % 360
+        let (deg, linesForUpright) = detectReadingOrientationWithOCR(from: directCG)
+        // Cache only when input is already upright (`deg == 0`); rotated pages get post-rotation OCR on export.
+        if cacheAccurateOCR, deg == 0, !linesForUpright.isEmpty {
+            let key = ocrCacheKey(for: item.sourceURL, pageIndex: item.pageIndexInPDF, rotationDegrees: finalRotBase)
+            storeOCRTextLines(linesForUpright, forKey: key)
+        }
+        return deg
     }
 
     static func detectReadingOrientationDegrees(from cgImage: CGImage) -> Int {
-        orientationLock.lock()
-        defer { orientationLock.unlock() }
-        return detectReadingOrientationDegrees(from: CIImage(cgImage: cgImage))
+        let prepared = downscaleCGImageIfNeeded(cgImage, maxSide: AppConstants.ocrOrientationMaxSide)
+        return detectReadingOrientationWithOCR(from: prepared).0
     }
 
-    private static func isCleanWord(_ word: String) -> Bool {
-        let trimmed = word.trimmingCharacters(in: CharacterSet.punctuationCharacters.union(.symbols))
-        guard trimmed.count >= 2 else { return false }
-        let scalars = Array(trimmed.unicodeScalars)
-        if scalars.allSatisfy({ CharacterSet.decimalDigits.contains($0) }) { return true }
-        guard scalars.allSatisfy({ CharacterSet.letters.contains($0) }) else { return false }
-        let upper = CharacterSet.uppercaseLetters
-        let upperCount = scalars.filter { upper.contains($0) }.count
-        if upperCount == 0 || upperCount == scalars.count { return true }
-        return upperCount == 1 && upper.contains(scalars[0])
+    private static func downscaleCGImageIfNeeded(_ cgImage: CGImage, maxSide: CGFloat) -> CGImage {
+        let longest = CGFloat(max(cgImage.width, cgImage.height))
+        guard longest > maxSide, longest > 0 else { return cgImage }
+        let scale = maxSide / longest
+        let ci = CIImage(cgImage: cgImage)
+        guard let filter = CIFilter(name: "CILanczosScaleTransform") else { return cgImage }
+        filter.setValue(ci, forKey: kCIInputImageKey)
+        filter.setValue(scale, forKey: kCIInputScaleKey)
+        filter.setValue(1.0, forKey: kCIInputAspectRatioKey)
+        guard let scaled = filter.outputImage else { return cgImage }
+        let norm = scaled.transformed(by: CGAffineTransform(translationX: -scaled.extent.minX, y: -scaled.extent.minY))
+        return ciContext.createCGImage(norm, from: norm.extent) ?? cgImage
     }
 
-    private static func detectReadingOrientationDegrees(from baseCI: CIImage) -> Int {
-        let baseNorm = baseCI.transformed(
-            by: CGAffineTransform(translationX: -baseCI.extent.minX, y: -baseCI.extent.minY)
-        )
+    /// Runs a single `.accurate` Vision OCR pass and determines reading orientation from each text
+    /// observation's true corner geometry (`topLeft -> topRight`), because Vision `.accurate` internally
+    /// decodes rotated text with high confidence across all 4 multiples of 90° while keeping corners unrotated.
+    private static func detectReadingOrientationWithOCR(
+        from cgImage: CGImage
+    ) -> (Int, [OCRTextLine]) {
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = true
+        request.recognitionLanguages = resolvedOCRLanguages
 
-        func scoreAngle(_ deg: Int) -> (score: Double, chars: Int) {
-            let rotated = deg == 0 ? baseNorm : applyClockwiseRotation(baseNorm, degrees: deg)
-            let norm = rotated.transformed(
-                by: CGAffineTransform(translationX: -rotated.extent.minX, y: -rotated.extent.minY)
-            )
-            guard let cg = ciContext.createCGImage(norm, from: norm.extent) else {
-                return (0, 0)
-            }
-
-            let request = VNRecognizeTextRequest()
-            request.recognitionLevel = .fast
-            request.usesLanguageCorrection = true
-
-            let handler = VNImageRequestHandler(cgImage: cg, options: [:])
-            do {
-                try handler.perform([request])
-            } catch {
-                return (0, 0)
-            }
-
-            var score = 0.0
-            var totalChars = 0
-            for obs in (request.results ?? []) {
-                guard let top = obs.topCandidates(1).first else { continue }
-                let trimmed = top.string.trimmingCharacters(in: .whitespacesAndNewlines)
-                if trimmed.contains("\u{FFFD}") { continue }
-
-                let alnumCount = trimmed.unicodeScalars.filter {
-                    CharacterSet.letters.contains($0) || CharacterSet.decimalDigits.contains($0)
-                }.count
-                guard alnumCount >= 3 else { continue }
-                guard obs.boundingBox.width >= obs.boundingBox.height * 1.2 else { continue }
-
-                let words = trimmed.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
-                let cleanWordBonus = words.filter { isCleanWord($0) }.count * 2
-                let c = Double(top.confidence)
-                let confWeight = c >= 0.45 ? (c * c * 2.5) : (c * c)
-                score += confWeight * Double(alnumCount + cleanWordBonus)
-                totalChars += alnumCount
-            }
-            return (score, totalChars)
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        do {
+            try handler.perform([request])
+        } catch {
+            return (0, [])
         }
 
-        let res0 = scoreAngle(0)
-        var bestDeg = 0
-        var bestScore = res0.score
-        var bestChars = res0.chars
+        let width = Double(cgImage.width)
+        let height = Double(cgImage.height)
+        var votes: [Int: Double] = [0: 0, 90: 0, 180: 0, 270: 0]
+        var totalChars = 0
+        var lines: [OCRTextLine] = []
 
-        var candidates: [Int]
-        if res0.score >= 60.0 {
-            candidates = [180]
-        } else {
-            candidates = [90, 270]
+        for obs in (request.results ?? []) {
+            guard let top = obs.topCandidates(1).first else { continue }
+            let trimmed = top.string.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty || trimmed.contains("\u{FFFD}") { continue }
+            lines.append(OCRTextLine(text: trimmed, boundingBox: obs.boundingBox))
+
+            let alnumCount = trimmed.unicodeScalars.filter {
+                CharacterSet.letters.contains($0) || CharacterSet.decimalDigits.contains($0)
+            }.count
+            guard alnumCount >= AppConstants.ocrMinLineAlnumCount else { continue }
+
+            // Vision normalized coordinates use a bottom-left origin; scale by pixels for aspect-true angles.
+            let ux = Double(obs.topRight.x - obs.topLeft.x) * width
+            let uy = Double(obs.topRight.y - obs.topLeft.y) * height
+            let vx = Double(obs.topLeft.x - obs.bottomLeft.x) * width
+            let vy = Double(obs.topLeft.y - obs.bottomLeft.y) * height
+            let uLen = hypot(ux, uy)
+            let vLen = hypot(vx, vy)
+            guard uLen >= 4.0, vLen >= 2.0 else { continue }
+            let cross = ux * vy - uy * vx
+            guard cross > 0.2 * uLen * vLen else { continue }
+
+            let phiDeg = atan2(uy, ux) * 180.0 / .pi
+            let normPhi = ((phiDeg.truncatingRemainder(dividingBy: 360.0)) + 360.0).truncatingRemainder(dividingBy: 360.0)
+            let snappedCWFix = (Int((normPhi + 45.0) / 90.0) * 90) % 360
+
+            let conf = Double(max(0, top.confidence))
+            votes[snappedCWFix, default: 0] += conf * conf * Double(alnumCount)
+            totalChars += alnumCount
         }
 
-        var checked180 = false
-        for deg in candidates {
-            if deg == 180 { checked180 = true }
-            let res = scoreAngle(deg)
-            if res.score > bestScore {
-                bestScore = res.score
-                bestDeg = deg
-                bestChars = res.chars
-            }
+        guard totalChars >= AppConstants.ocrMinCharacters else {
+            return (0, lines)
         }
-
-        // Sparse-page fallback: if neither horizontal (0) nor vertical (90/270) reached threshold, also test 180
-        if !checked180 && bestScore < 60.0 {
-            let res180 = scoreAngle(180)
-            if res180.score > bestScore {
-                bestScore = res180.score
-                bestDeg = 180
-                bestChars = res180.chars
-            }
+        let totalWeight = votes.values.reduce(0, +)
+        guard totalWeight > 0, let best = votes.max(by: { $0.value < $1.value }) else {
+            return (0, lines)
         }
-
-        if bestDeg == 0 || bestChars < 6 {
-            return 0
+        if best.key == 0 {
+            return (0, lines)
         }
-        return bestScore > res0.score * 1.15 ? bestDeg : 0
+        let uprightWeight = votes[0, default: 0]
+        let hasMarginOverUpright = best.value > uprightWeight * AppConstants.ocrImprovementFactor
+        let isDominant = best.value >= totalWeight * AppConstants.ocrDominanceRatio
+        return (hasMarginOverUpright && isDominant) ? (best.key, []) : (0, lines)
     }
+
+    static func fileModificationTimestamp(for url: URL) -> Int64 {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        guard let date = attrs?[.modificationDate] as? Date else { return 0 }
+        return Int64((date.timeIntervalSince1970 * 1000.0).rounded())
+    }
+
+    static func previewCacheKey(for item: InputPageItem, settings: ScanSettings) -> String {
+        let deg = ((item.rotationDegrees % 360) + 360) % 360
+        let mtimeMs = fileModificationTimestamp(for: item.sourceURL)
+        let pageToken = item.pageIndexInPDF.map(String.init) ?? "img"
+        let raw = [
+            item.sourceURL.standardizedFileURL.resolvingSymlinksInPath().path,
+            pageToken,
+            String(mtimeMs),
+            String(deg),
+            settings.imageProcessingSignature
+        ].joined(separator: "::")
+        let digest = SHA256.hash(data: Data(raw.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    static let fastCopyImageExtensions: Set<String> = ["jpg", "jpeg", "png"]
 
     static func stageItemToImageFile(
         item: InputPageItem,
@@ -366,8 +483,8 @@ enum PDFToolsService {
         let deg = ((item.rotationDegrees % 360) + 360) % 360
         let ext = item.sourceURL.pathExtension.lowercased()
 
-        // Fast copy when input is an unrotated non-HEIC image
-        if item.pageIndexInPDF == nil && deg == 0 && ext != "heic" && ext != "heif" {
+        // Fast copy only for unrotated JPEG/PNG; convert TIFF/BMP/WebP/HEIC or rotated images cleanly
+        if item.pageIndexInPDF == nil && deg == 0 && fastCopyImageExtensions.contains(ext) {
             let safeStem = sanitizeStem(item.sourceURL.deletingPathExtension().lastPathComponent)
             let dest = stagingDir.appendingPathComponent(String(format: "%04d_%@.%@", index + 1, safeStem, ext))
             if FileManager.default.fileExists(atPath: dest.path) {
@@ -377,29 +494,39 @@ enum PDFToolsService {
             return dest
         }
 
-        let dest = stagingDir.appendingPathComponent(String(format: "%04d_page.jpg", index + 1))
-
         if let pageIdx = item.pageIndexInPDF {
+            let dest = stagingDir.appendingPathComponent(String(format: "%04d_page.png", index + 1))
             guard let doc = PDFDocument(url: item.sourceURL),
                   let page = doc.page(at: pageIdx) else {
                 throw PDFToolError.invalidPDF(item.sourceURL)
             }
-            let cgImg = try renderPDFPageToCGImage(page: page, dpi: 260, extraClockwiseRotation: deg)
-            try writeJPEG(cgImage: cgImg, to: dest, quality: 0.94)
+            let cgImg = try renderPDFPageToCGImage(page: page, dpi: AppConstants.pdfRenderDPI, extraClockwiseRotation: deg)
+            try writePNG(cgImage: cgImg, to: dest)
             return dest
         }
 
-        guard let ciLoaded = CIImage(contentsOf: item.sourceURL, options: [.applyOrientationProperty: true]) else {
+        let dest = stagingDir.appendingPathComponent(String(format: "%04d_page.png", index + 1))
+        let ciLoaded: CIImage
+        if let direct = CIImage(contentsOf: item.sourceURL, options: [.applyOrientationProperty: true]),
+           direct.extent.width > 0, direct.extent.height > 0 {
+            ciLoaded = direct
+        } else if let src = CGImageSourceCreateWithURL(item.sourceURL as CFURL, nil),
+                  let cgFallback = CGImageSourceCreateImageAtIndex(src, 0, nil) {
+            ciLoaded = CIImage(cgImage: cgFallback)
+        } else {
             throw PDFToolError.imageLoadFailed(item.sourceURL)
         }
+
         let rotated = applyClockwiseRotation(ciLoaded, degrees: deg)
         let originNormalized = rotated.transformed(
             by: CGAffineTransform(translationX: -rotated.extent.minX, y: -rotated.extent.minY)
         )
-        guard let cgImg = ciContext.createCGImage(originNormalized, from: originNormalized.extent) else {
+        let whiteBG = CIImage(color: CIColor.white).cropped(to: originNormalized.extent)
+        let flattened = originNormalized.composited(over: whiteBG)
+        guard let cgImg = ciContext.createCGImage(flattened, from: flattened.extent) else {
             throw PDFToolError.imageLoadFailed(item.sourceURL)
         }
-        try writeJPEG(cgImage: cgImg, to: dest, quality: 0.94)
+        try writePNG(cgImage: cgImg, to: dest)
         return dest
     }
 
@@ -460,6 +587,21 @@ enum PDFToolsService {
         }
         let props: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: quality]
         CGImageDestinationAddImage(dest, cgImage, props as CFDictionary)
+        if !CGImageDestinationFinalize(dest) {
+            throw PDFToolError.writeFailed(url)
+        }
+    }
+
+    private static func writePNG(cgImage: CGImage, to url: URL) throws {
+        guard let dest = CGImageDestinationCreateWithURL(
+            url as CFURL,
+            UTType.png.identifier as CFString,
+            1,
+            nil
+        ) else {
+            throw PDFToolError.writeFailed(url)
+        }
+        CGImageDestinationAddImage(dest, cgImage, nil)
         if !CGImageDestinationFinalize(dest) {
             throw PDFToolError.writeFailed(url)
         }
@@ -563,7 +705,7 @@ enum PDFToolsService {
             }
             return page
         }
-        guard let img = loadDisplayImage(for: item, maxSide: 4000),
+        guard let img = loadDisplayImage(for: item, maxSide: AppConstants.pdfMakeMaxSide),
               let page = PDFPage(image: img) else {
             throw PDFToolError.imageLoadFailed(item.sourceURL)
         }
@@ -579,7 +721,7 @@ enum PDFToolsService {
             }
             return page
         }
-        guard let img = makeImageThumbnail(url: url, maxSide: 4000),
+        guard let img = makeImageThumbnail(url: url, maxSide: AppConstants.pdfMakeMaxSide),
               let page = PDFPage(image: img) else {
             throw PDFToolError.invalidBackSource(url)
         }
@@ -684,10 +826,49 @@ enum PDFToolsService {
         return outputs
     }
 
+    private static func drawInvisibleOCRTextLayer(
+        lines: [OCRTextLine],
+        in ctx: CGContext,
+        drawRect: CGRect
+    ) {
+        guard !lines.isEmpty else { return }
+        ctx.saveGState()
+        ctx.setTextDrawingMode(.invisible)
+        for item in lines {
+            let clean = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !clean.isEmpty else { continue }
+            let box = item.boundingBox
+            let targetW = max(2.0, box.width * drawRect.width)
+            let targetH = max(4.0, box.height * drawRect.height)
+            let originX = drawRect.minX + box.minX * drawRect.width
+            let originY = drawRect.minY + box.minY * drawRect.height
+
+            let font = CTFontCreateWithName("Helvetica" as CFString, max(4.0, targetH * 0.85), nil)
+            guard let attrStr = CFAttributedStringCreate(
+                nil,
+                clean as CFString,
+                [kCTFontAttributeName: font] as CFDictionary
+            ) else { continue }
+
+            let ctLine = CTLineCreateWithAttributedString(attrStr)
+            let typographicW = CTLineGetTypographicBounds(ctLine, nil, nil, nil)
+            let scaleX = typographicW > 0.5 ? (targetW / CGFloat(typographicW)) : 1.0
+
+            ctx.textMatrix = CGAffineTransform(
+                a: scaleX, b: 0,
+                c: 0, d: 1.0,
+                tx: originX, ty: originY + targetH * 0.12
+            )
+            CTLineDraw(ctLine, ctx)
+        }
+        ctx.restoreGState()
+    }
+
     static func compileProcessedImagesToPDF(
         imageURLs: [URL],
         destinationURL: URL,
-        settings: ScanSettings
+        settings: ScanSettings,
+        sourceItems: [InputPageItem]? = nil
     ) throws {
         guard !imageURLs.isEmpty else {
             throw PDFToolError.emptyInput("Không có ảnh đã xử lý để đóng gói PDF.")
@@ -702,7 +883,7 @@ enum PDFToolsService {
         }
 
         var renderedPages = 0
-        for imgURL in imageURLs {
+        for (idx, imgURL) in imageURLs.enumerated() {
             let ext = imgURL.pathExtension.lowercased()
             var cgImg: CGImage?
 
@@ -754,6 +935,26 @@ enum PDFToolsService {
             let drawY = (Double(pageSize.height) - drawH) / 2.0
             let drawRect = CGRect(x: drawX, y: drawY, width: drawW, height: drawH)
 
+            var ocrLines: [OCRTextLine] = []
+            if settings.enableOCR {
+                // Share Q10 OCR observations when crop didn't alter page geometry; otherwise recognize processed image & cache
+                if !settings.autoCrop,
+                   let sourceItems, idx < sourceItems.count {
+                    let srcKey = ocrCacheKey(
+                        for: sourceItems[idx].sourceURL,
+                        pageIndex: sourceItems[idx].pageIndexInPDF,
+                        rotationDegrees: sourceItems[idx].rotationDegrees
+                    )
+                    if let reused = cachedOCRTextLines(forKey: srcKey) {
+                        ocrLines = reused
+                    }
+                }
+                if ocrLines.isEmpty {
+                    let procKey = ocrCacheKey(for: imgURL)
+                    ocrLines = recognizeTextLines(in: loadedCG, recognitionLevel: .accurate, cacheKey: procKey)
+                }
+            }
+
             var mediaBox = CGRect(origin: .zero, size: pageSize)
             let pageInfo: [CFString: Any] = [
                 kCGPDFContextMediaBox: NSData(bytes: &mediaBox, length: MemoryLayout<CGRect>.size)
@@ -762,6 +963,9 @@ enum PDFToolsService {
             pdfContext.setFillColor(CGColor(gray: 1.0, alpha: 1.0))
             pdfContext.fill(mediaBox)
             pdfContext.draw(loadedCG, in: drawRect)
+            if settings.enableOCR && !ocrLines.isEmpty {
+                drawInvisibleOCRTextLayer(lines: ocrLines, in: pdfContext, drawRect: drawRect)
+            }
             pdfContext.endPDFPage()
             renderedPages += 1
         }

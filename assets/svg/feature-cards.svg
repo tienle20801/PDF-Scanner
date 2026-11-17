@@ -254,10 +254,10 @@
 
     <!-- Top Right Category Badge -->
     <rect x="184" y="18" width="84" height="22" rx="11" fill="#06b6d4" fill-opacity="0.12" stroke="#06b6d4" stroke-width="1" stroke-opacity="0.3" />
-    <text x="226" y="32.5" fill="#22d3ee" class="font-mono" font-size="9" font-weight="700" text-anchor="middle" letter-spacing="0.04em">300 DPI NATIVE</text>
+    <text x="226" y="32.5" fill="#22d3ee" class="font-mono" font-size="9" font-weight="700" text-anchor="middle" letter-spacing="0.04em">200–300 DPI</text>
 
     <!-- Card Title -->
-    <text x="18" y="84" fill="#f8fafc" class="font-title" font-size="15" letter-spacing="-0.01em">Lossless HD 300 DPI</text>
+    <text x="18" y="84" fill="#f8fafc" class="font-title" font-size="15" letter-spacing="-0.01em">Configurable HD PDF</text>
 
     <!-- Card Description (Prompt exact text) -->
     <text x="18" y="105" fill="#94a3b8" class="font-body" font-size="11.5" font-weight="400">Crystal-clear formula, mathematical</text>
