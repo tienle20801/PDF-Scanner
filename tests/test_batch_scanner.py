@@ -14,9 +14,12 @@ from PIL import Image, ImageDraw
 from pypdf import PdfReader
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import batch_scanner  # noqa: E402
+import pdf_compressor  # noqa: E402
+import scan_to_pdf  # noqa: E402
 
 
 def _make_doc_image(
@@ -786,6 +789,561 @@ ctx.closePDF()
             res_vec = _run_cli([str(vec_pdf), str(d / "vec_out.pdf"), "--no-crop"])
             self.assertNotEqual(res_vec.returncode, 0)
             self.assertIn("vector/text", res_vec.stderr)
+
+    def test_p1_19_16bit_grayscale_and_pa_rgb_trns_transparency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            # 16-bit grayscale PNG (I;16): dark ink 5000 on light paper 50000
+            arr16 = np.full((120, 120), 50000, dtype=np.uint16)
+            arr16[30:90, 30:90] = 5000
+            g16_path = d / "gray16.png"
+            cv2.imwrite(str(g16_path), arr16)
+            bgr16 = batch_scanner.load_image_bgr(str(g16_path))
+            self.assertEqual(bgr16.dtype, np.uint8)
+            self.assertLess(int(bgr16[60, 60].mean()), 35)
+            self.assertGreater(int(bgr16[5, 5].mean()), 175)
+            self.assertLess(int(bgr16[5, 5].mean()), 215)
+
+            # I;16B big-endian and 32-bit 'I' mode scaling
+            raw_be = np.array([[5000, 50000]], dtype=">u2").tobytes()
+            im_be = Image.frombytes("I;16B", (2, 1), raw_be)
+            bgr_be = batch_scanner._pil_to_bgr(im_be)
+            self.assertEqual(bgr_be[0, 0].tolist(), [19, 19, 19])
+            self.assertEqual(bgr_be[0, 1].tolist(), [195, 195, 195])
+
+            im_i = Image.fromarray(np.array([[5000, 50000]], dtype=np.int32), mode="I")
+            bgr_i = batch_scanner._pil_to_bgr(im_i)
+            self.assertEqual(bgr_i[0, 0].tolist(), [19, 19, 19])
+            self.assertEqual(bgr_i[0, 1].tolist(), [195, 195, 195])
+
+            # PA mode transparent corners must flatten onto white (255, 255, 255)
+            pa_src = Image.new("RGBA", (80, 80), (0, 0, 0, 0))
+            for y in range(25, 55):
+                for x in range(25, 55):
+                    pa_src.putpixel((x, y), (20, 30, 180, 255))
+            pa_img = pa_src.convert("PA")
+            bgr_pa = batch_scanner._pil_to_bgr(pa_img)
+            self.assertEqual(bgr_pa[5, 5].tolist(), [255, 255, 255])
+            self.assertGreater(int(bgr_pa[40, 40][0]), 150)  # Blue pixel in BGR
+
+            # RGB+tRNS PNG transparent corners must flatten onto white (255, 255, 255)
+            rgb_trns = Image.new("RGB", (80, 80), (0, 0, 0))
+            for y in range(25, 55):
+                for x in range(25, 55):
+                    rgb_trns.putpixel((x, y), (180, 20, 20))
+            trns_path = d / "rgb_trns.png"
+            rgb_trns.save(trns_path, format="PNG", transparency=(0, 0, 0))
+            bgr_trns = batch_scanner.load_image_bgr(str(trns_path))
+            self.assertEqual(bgr_trns[5, 5].tolist(), [255, 255, 255])
+            self.assertGreater(int(bgr_trns[40, 40][2]), 150)
+
+            # L+tRNS PNG transparent corners must flatten onto white (255, 255, 255)
+            l_trns = Image.new("L", (80, 80), 0)
+            for y in range(25, 55):
+                for x in range(25, 55):
+                    l_trns.putpixel((x, y), 100)
+            l_path = d / "l_trns.png"
+            l_trns.save(l_path, format="PNG", transparency=0)
+            bgr_l = batch_scanner.load_image_bgr(str(l_path))
+            self.assertEqual(bgr_l[5, 5].tolist(), [255, 255, 255])
+            self.assertEqual(bgr_l[40, 40].tolist(), [100, 100, 100])
+
+    def test_p1_3_unicode_nfc_nfd_vision_manifest_lookup(self):
+        import unicodedata
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            nfc_name = unicodedata.normalize("NFC", 'ngày 2.11 "quote".png')
+            nfd_name = unicodedata.normalize("NFD", 'ngày 2.11 "quote".png')
+            self.assertNotEqual(nfc_name, nfd_name)
+
+            img = _make_doc_image(900, 1200, with_border=True)
+            img_path = d / nfc_name
+            cv2.imwrite(str(img_path), img)
+
+            # 1. Helper normalizes both NFC and NFD variants to the same NFC string
+            canon_nfc = batch_scanner._canonical_path(str(d / nfc_name))
+            canon_nfd = batch_scanner._canonical_path(str(d / nfd_name))
+            self.assertEqual(canon_nfc, canon_nfd)
+            self.assertEqual(canon_nfc, unicodedata.normalize("NFC", canon_nfc))
+
+            # 2. crop_via_vision normalizes NFD paths in manifest results to NFC keys
+            v_manifest = d / "vision_manifest.json"
+            v_manifest.write_text(
+                json.dumps(
+                    {
+                        "results": [
+                            {
+                                "input": os.path.realpath(str(d / nfd_name)),
+                                "status": "ok",
+                                "detected": True,
+                                "method": "document_segmentation",
+                                "confidence": 0.97,
+                                "width": 900,
+                                "height": 1200,
+                                "quad": [[108, 120], [792, 120], [792, 1080], [108, 1080]],
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch("batch_scanner.subprocess.run") as m_run:
+                m_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+                v_map = batch_scanner.crop_via_vision([canon_nfc], ["echo"], 0.45, False, d)
+            self.assertIn(canon_nfc, v_map)
+            self.assertEqual(v_map[canon_nfc]["method"], "document_segmentation")
+
+            # 3. Real end-to-end CLI run with --crop-engine vision on Vietnamese NFC file
+            out_pdf = d / "vn_vision.pdf"
+            out_man = d / "vn_manifest.json"
+            proc = _run_cli(
+                [
+                    str(d),
+                    str(out_pdf),
+                    "--crop-engine",
+                    "vision",
+                    "--mode",
+                    "original",
+                    "--manifest",
+                    str(out_man),
+                ]
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            m = json.loads(out_man.read_text(encoding="utf-8"))
+            self.assertEqual(len(m["results"]), 1)
+            self.assertTrue(
+                m["results"][0]["method"].startswith("vision:"),
+                f"Expected vision crop match, got: {m['results'][0]}",
+            )
+            self.assertEqual(m["results"][0]["input"], unicodedata.normalize("NFC", m["results"][0]["input"]))
+
+    def test_p1_6_symlink_safe_atomic_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            victim = d / "victim.txt"
+            victim.write_text("DO NOT TOUCH", encoding="utf-8")
+
+            in_dir = d / "in"
+            in_dir.mkdir()
+            cv2.imwrite(str(in_dir / "p1.png"), _make_doc_image(700, 900))
+
+            manifest_path = d / "manifest.json"
+            out_pdf = d / "out.pdf"
+            (d / "manifest.json.tmp").symlink_to(victim)
+            (d / f"out.pdf.tmp.{os.getpid()}").symlink_to(victim)
+
+            proc = _run_cli(
+                [
+                    str(in_dir),
+                    str(out_pdf),
+                    "--no-crop",
+                    "--crop-engine",
+                    "opencv",
+                    "--manifest",
+                    str(manifest_path),
+                ]
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(victim.read_text(encoding="utf-8"), "DO NOT TOUCH")
+            self.assertTrue(manifest_path.exists())
+            self.assertTrue(out_pdf.exists())
+
+            # Same-PID in-process batch_scanner symlink trap check
+            inproc_pdf = d / "out_inproc.pdf"
+            inproc_man = d / "man_inproc.json"
+            (d / "man_inproc.json.tmp").symlink_to(victim)
+            (d / f"out_inproc.pdf.tmp.{os.getpid()}").symlink_to(victim)
+            ok = batch_scanner.convert_folder_to_hd_pdf(
+                input_path=str(in_dir),
+                output_pdf_path=str(inproc_pdf),
+                auto_crop=False,
+                crop_engine="opencv",
+                manifest_path=str(inproc_man),
+            )
+            self.assertTrue(ok)
+            self.assertEqual(victim.read_text(encoding="utf-8"), "DO NOT TOUCH")
+
+            # Compressor symlink trap check
+            comp_pdf = d / "comp.pdf"
+            (d / f"comp.pdf.tmp.{os.getpid()}").symlink_to(victim)
+            rep = pdf_compressor.compress_pdf(str(out_pdf), str(comp_pdf), dpi=150)
+            self.assertEqual(victim.read_text(encoding="utf-8"), "DO NOT TOUCH")
+            self.assertGreater(rep["after_bytes"], 0)
+
+    def test_p1_20_compressor_autocrop_rotate_inplace_and_search(self):
+        import io
+        from pypdf import PageObject, PdfWriter
+        from pypdf.generic import DecodedStreamObject, DictionaryObject, EncodedStreamObject, NameObject, NumberObject
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+
+            # 20a: auto_crop=True on portrait 2000x3000 containing landscape 1600x1000 document
+            canvas = np.full((3000, 2000, 3), (30, 35, 45), dtype=np.uint8)
+            canvas[1000:2000, 200:1800] = (242, 242, 242)
+            cv2.rectangle(canvas, (260, 1060), (1740, 1940), (35, 35, 35), 4)
+            buf_a = io.BytesIO()
+            Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)).save(buf_a, format="JPEG", quality=92)
+            w_a = PdfWriter()
+            pg_a = PageObject.create_blank_page(width=595.28, height=841.89)
+            x_a = EncodedStreamObject()
+            x_a.update(
+                {
+                    NameObject("/Type"): NameObject("/XObject"),
+                    NameObject("/Subtype"): NameObject("/Image"),
+                    NameObject("/Width"): NumberObject(2000),
+                    NameObject("/Height"): NumberObject(3000),
+                    NameObject("/ColorSpace"): NameObject("/DeviceRGB"),
+                    NameObject("/BitsPerComponent"): NumberObject(8),
+                    NameObject("/Filter"): NameObject("/DCTDecode"),
+                }
+            )
+            x_a._data = buf_a.getvalue()
+            pg_a[NameObject("/Resources")] = DictionaryObject(
+                {NameObject("/XObject"): DictionaryObject({NameObject("/Im0"): w_a._add_object(x_a)})}
+            )
+            cs_a = DecodedStreamObject()
+            cs_a.set_data(b"q 595.28 0 0 841.89 0 0 cm /Im0 Do Q")
+            pg_a[NameObject("/Contents")] = w_a._add_object(cs_a)
+            w_a.add_page(pg_a)
+            in_a = d / "autocrop.pdf"
+            out_a = d / "autocrop_out.pdf"
+            with open(in_a, "wb") as fp:
+                w_a.write(fp)
+            pdf_compressor.compress_pdf(str(in_a), str(out_a), dpi=150, auto_crop=True)
+            out_w_a, out_h_a = PdfReader(str(out_a)).pages[0].images[0].image.size
+            self.assertGreater(out_w_a, out_h_a, f"Cropped landscape doc stretched to portrait: {(out_w_a, out_h_a)}")
+            self.assertAlmostEqual(out_w_a / float(out_h_a), 1.6, delta=0.08)
+            self.assertLessEqual(out_w_a, 1600)
+            self.assertLessEqual(out_h_a, 1000)
+
+            # 20b: /Rotate 90 + rotated CTM at exact 150 DPI must NOT over-downscale
+            rot_arr = _make_doc_image(1754, 1240)
+            buf_b = io.BytesIO()
+            Image.fromarray(cv2.cvtColor(rot_arr, cv2.COLOR_BGR2RGB)).save(buf_b, format="JPEG", quality=92)
+            w_b = PdfWriter()
+            pg_b = PageObject.create_blank_page(width=595.28, height=841.89)
+            pg_b[NameObject("/Rotate")] = NumberObject(90)
+            x_b = EncodedStreamObject()
+            x_b.update(
+                {
+                    NameObject("/Type"): NameObject("/XObject"),
+                    NameObject("/Subtype"): NameObject("/Image"),
+                    NameObject("/Width"): NumberObject(1754),
+                    NameObject("/Height"): NumberObject(1240),
+                    NameObject("/ColorSpace"): NameObject("/DeviceRGB"),
+                    NameObject("/BitsPerComponent"): NumberObject(8),
+                    NameObject("/Filter"): NameObject("/DCTDecode"),
+                }
+            )
+            x_b._data = buf_b.getvalue()
+            pg_b[NameObject("/Resources")] = DictionaryObject(
+                {NameObject("/XObject"): DictionaryObject({NameObject("/Im0"): w_b._add_object(x_b)})}
+            )
+            cs_b = DecodedStreamObject()
+            cs_b.set_data(b"q 0 841.89 -595.28 0 595.28 0 cm /Im0 Do Q")
+            pg_b[NameObject("/Contents")] = w_b._add_object(cs_b)
+            w_b.add_page(pg_b)
+            in_b = d / "rot90.pdf"
+            out_b = d / "rot90_out.pdf"
+            with open(in_b, "wb") as fp:
+                w_b.write(fp)
+            pdf_compressor.compress_pdf(str(in_b), str(out_b), dpi=150)
+            self.assertEqual(PdfReader(str(out_b)).pages[0].images[0].image.size, (1754, 1240))
+
+            # Also test /Rotate 270 without ContentStream CTM (fallback page_size_inches swap)
+            w_b2 = PdfWriter()
+            pg_b2 = PageObject.create_blank_page(width=595.28, height=841.89)
+            pg_b2[NameObject("/Rotate")] = NumberObject(270)
+            x_b2 = EncodedStreamObject()
+            x_b2.update(dict(x_b))
+            x_b2._data = buf_b.getvalue()
+            pg_b2[NameObject("/Resources")] = DictionaryObject(
+                {NameObject("/XObject"): DictionaryObject({NameObject("/Im0"): w_b2._add_object(x_b2)})}
+            )
+            w_b2.add_page(pg_b2)
+            in_b2 = d / "rot270_noctm.pdf"
+            out_b2 = d / "rot270_noctm_out.pdf"
+            with open(in_b2, "wb") as fp:
+                w_b2.write(fp)
+            pdf_compressor.compress_pdf(str(in_b2), str(out_b2), dpi=150)
+            self.assertEqual(PdfReader(str(out_b2)).pages[0].images[0].image.size, (1754, 1240))
+
+            # 20c & 20d: Noisy 1800x2400 PDF for in-place equivalence + non-monotonic search + dpi<=base_dpi clamp
+            rng = np.random.default_rng(7)
+            noisy = rng.integers(80, 240, (2400, 1800, 3), dtype=np.uint8)
+            noisy_jpg = d / "noisy.jpg"
+            Image.fromarray(noisy).save(noisy_jpg, format="JPEG", quality=96)
+            in_c = d / "noisy.pdf"
+            batch_scanner.assemble_pdf_from_pages(
+                [{"image_path": str(noisy_jpg), "format": "jpeg", "width": 1800, "height": 2400, "color_space": "/DeviceRGB"}],
+                str(in_c),
+                page_size="a4",
+                dpi=300,
+                margin=0.0,
+            )
+
+            # Check in-place vs separate output equivalence when target search triggers
+            out_clean = d / "clean_target.pdf"
+            in_place = d / "inplace_target.pdf"
+            in_place.write_bytes(in_c.read_bytes())
+            r_init = pdf_compressor.compress_pdf(str(in_c), str(d / "init_probe.pdf"), dpi=150, jpeg_quality=80)
+            # Pick target slightly below initial Q=80 size to force target-budget search
+            target_mb_c = (r_init["after_bytes"] - 2048) / (1024.0 * 1024.0)
+            rep_clean = pdf_compressor.compress_pdf(str(in_c), str(out_clean), dpi=150, jpeg_quality=80, target_mb=target_mb_c)
+            rep_inplace = pdf_compressor.compress_pdf(str(in_place), str(in_place), dpi=150, jpeg_quality=80, target_mb=target_mb_c)
+            self.assertEqual(rep_clean["used_dpi"], rep_inplace["used_dpi"])
+            self.assertEqual(rep_clean["used_quality"], rep_inplace["used_quality"])
+            self.assertEqual(rep_clean["after_bytes"], rep_inplace["after_bytes"])
+
+            # 20d: Measure (125, 35) vs (100, 75) non-monotonicity and assert (125, 35) is NOT skipped
+            r_125_35 = pdf_compressor.compress_pdf(str(in_c), str(d / "p125_35.pdf"), dpi=125, jpeg_quality=35)
+            r_100_75 = pdf_compressor.compress_pdf(str(in_c), str(d / "p100_75.pdf"), dpi=100, jpeg_quality=75)
+            if r_125_35["after_bytes"] < r_100_75["after_bytes"]:
+                budget_bytes = (r_125_35["after_bytes"] + r_100_75["after_bytes"]) // 2
+                rep_mono = pdf_compressor.compress_pdf(
+                    str(in_c),
+                    str(d / "mono_out.pdf"),
+                    dpi=125,
+                    jpeg_quality=80,
+                    target_mb=budget_bytes / (1024.0 * 1024.0),
+                )
+                self.assertEqual(rep_mono["used_dpi"], 125)
+                self.assertTrue(rep_mono["target_achieved"])
+
+            # Clamp candidate DPIs strictly <= base_dpi (base_dpi=72 must never jump to 85)
+            rep_72 = pdf_compressor.compress_pdf(
+                str(in_c),
+                str(d / "clamp72.pdf"),
+                dpi=72,
+                jpeg_quality=80,
+                target_mb=0.001,
+            )
+            self.assertLessEqual(rep_72["used_dpi"], 72)
+
+    def test_p2_compressor_bw_multiimage_bloat_and_error_json(self):
+        import io
+        from pypdf import PageObject, PdfWriter
+        from pypdf.generic import DecodedStreamObject, DictionaryObject, EncodedStreamObject, NameObject, NumberObject
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+
+            # 1. mode="bw" produces 1-bit /FlateDecode /DeviceGray stream (no JPEG bloat)
+            doc_img = _make_doc_image(1200, 1600)
+            src_jpg = d / "doc.jpg"
+            Image.fromarray(cv2.cvtColor(doc_img, cv2.COLOR_BGR2RGB)).save(src_jpg, quality=92)
+            src_pdf = d / "doc.pdf"
+            batch_scanner.assemble_pdf_from_pages(
+                [{"image_path": str(src_jpg), "format": "jpeg", "width": 1200, "height": 1600, "color_space": "/DeviceRGB"}],
+                str(src_pdf),
+                page_size="a4",
+                dpi=200,
+                margin=0.0,
+            )
+            bw_pdf = d / "doc_bw.pdf"
+            gray_pdf = d / "doc_gray.pdf"
+            pdf_compressor.compress_pdf(str(src_pdf), str(bw_pdf), dpi=150, mode="bw")
+            pdf_compressor.compress_pdf(str(src_pdf), str(gray_pdf), dpi=150, mode="grayscale")
+            bw_xobj = next(iter(PdfReader(str(bw_pdf)).pages[0]["/Resources"]["/XObject"].values())).get_object()
+            self.assertEqual(int(bw_xobj["/BitsPerComponent"]), 1)
+            self.assertEqual(str(bw_xobj["/Filter"]), "/FlateDecode")
+            self.assertEqual(str(bw_xobj["/ColorSpace"]), "/DeviceGray")
+            self.assertLess(bw_pdf.stat().st_size, gray_pdf.stat().st_size)
+
+            # 2. Font page with multiple 500x500 JPEGs (sum_px = 6 * 250k >= 300k) must recompress all 6
+            w_multi = PdfWriter()
+            pg_m = PageObject.create_blank_page(width=595.28, height=841.89)
+            pg_m[NameObject("/Resources")] = DictionaryObject(
+                {
+                    NameObject("/Font"): DictionaryObject({NameObject("/F1"): DictionaryObject()}),
+                    NameObject("/XObject"): DictionaryObject(),
+                }
+            )
+            for idx in range(6):
+                tile = np.random.default_rng(idx).integers(100, 240, (500, 500, 3), dtype=np.uint8)
+                tbuf = io.BytesIO()
+                Image.fromarray(tile).save(tbuf, format="JPEG", quality=98)
+                xo = EncodedStreamObject()
+                xo.update(
+                    {
+                        NameObject("/Type"): NameObject("/XObject"),
+                        NameObject("/Subtype"): NameObject("/Image"),
+                        NameObject("/Width"): NumberObject(500),
+                        NameObject("/Height"): NumberObject(500),
+                        NameObject("/ColorSpace"): NameObject("/DeviceRGB"),
+                        NameObject("/BitsPerComponent"): NumberObject(8),
+                        NameObject("/Filter"): NameObject("/DCTDecode"),
+                    }
+                )
+                xo._data = tbuf.getvalue()
+                pg_m["/Resources"]["/XObject"][NameObject(f"/Im{idx}")] = w_multi._add_object(xo)
+            w_multi.add_page(pg_m)
+            multi_pdf = d / "multi.pdf"
+            multi_out = d / "multi_out.pdf"
+            with open(multi_pdf, "wb") as fp:
+                w_multi.write(fp)
+            rep_multi = pdf_compressor.compress_pdf(str(multi_pdf), str(multi_out), dpi=150, jpeg_quality=60)
+            self.assertEqual(rep_multi["recompressed_images"], 6)
+            self.assertLess(rep_multi["after_bytes"], rep_multi["before_bytes"])
+
+            # 3. Bloat guard under non-forced compress (original, auto_crop=False)
+            tiny_arr = np.full((300, 300, 3), 230, dtype=np.uint8)
+            tiny_jpg = d / "tiny_q30.jpg"
+            Image.fromarray(tiny_arr).save(tiny_jpg, format="JPEG", quality=30)
+            tiny_pdf = d / "tiny.pdf"
+            batch_scanner.assemble_pdf_from_pages(
+                [{"image_path": str(tiny_jpg), "format": "jpeg", "width": 300, "height": 300, "color_space": "/DeviceRGB"}],
+                str(tiny_pdf),
+                page_size="a4",
+                dpi=200,
+                margin=0.0,
+            )
+            tiny_out = d / "tiny_out.pdf"
+            rep_bloat = pdf_compressor.compress_pdf(str(tiny_pdf), str(tiny_out), dpi=150, jpeg_quality=95)
+            self.assertLessEqual(rep_bloat["after_bytes"], rep_bloat["before_bytes"])
+
+            # 4. Target unmet message uses MiB consistently (no "0.0 MB")
+            rep_unmet = pdf_compressor.compress_pdf(str(tiny_pdf), str(d / "unmet.pdf"), dpi=150, target_mb=0.001)
+            self.assertFalse(rep_unmet["target_achieved"])
+            self.assertIn("MiB", rep_unmet["message"])
+            self.assertNotIn("0.0 MB", rep_unmet["message"])
+
+            # 5. Corrupt, encrypted, and missing PDFs write valid --json-report, clean stderr (no Traceback), exit 1
+            corrupt_pdf = d / "corrupt.pdf"
+            corrupt_pdf.write_bytes(b"not a pdf")
+            enc_pdf = d / "encrypted.pdf"
+            ew = PdfWriter()
+            ew.add_blank_page(200, 200)
+            ew.encrypt("secret123")
+            with open(enc_pdf, "wb") as fp:
+                ew.write(fp)
+            missing_pdf = d / "missing.pdf"
+
+            for case_name, src in [("corrupt", corrupt_pdf), ("encrypted", enc_pdf), ("missing", missing_pdf)]:
+                jrep = d / f"rep_{case_name}.json"
+                proc = subprocess.run(
+                    [
+                        sys.executable,
+                        str(REPO_ROOT / "scripts" / "pdf_compressor.py"),
+                        str(src),
+                        str(d / f"out_{case_name}.pdf"),
+                        "--json-report",
+                        str(jrep),
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+                self.assertTrue(jrep.exists(), f"{case_name} missing json report")
+                jdata = json.loads(jrep.read_text(encoding="utf-8"))
+                self.assertEqual(jdata.get("status"), "error")
+                self.assertTrue(len(jdata.get("message", "")) > 0)
+
+    def test_p2_worker_stdio_edge_cases_downscale_and_scan_to_pdf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            dir_a = d / "dirA"
+            dir_b = d / "dirB"
+            dir_a.mkdir()
+            dir_b.mkdir()
+            shared_emit = d / "shared_emit"
+
+            img_a = dir_a / "scan (2026) v1.png"
+            img_b = dir_b / "scan (2026) v1.png"
+            cv2.imwrite(str(img_a), _make_doc_image(700, 900, accent_bgr=(0, 0, 230)))
+            cv2.imwrite(str(img_b), _make_doc_image(700, 900, accent_bgr=(230, 0, 0)))
+
+            txt_file = d / "notes.txt"
+            txt_file.write_text("not an image", encoding="utf-8")
+            pdf_file = d / "sample.pdf"
+            pdf_file.write_bytes(b"%PDF-1.4\n")
+
+            with subprocess.Popen(
+                [sys.executable, str(REPO_ROOT / "scripts" / "batch_scanner.py"), "--worker-stdio"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=str(d),
+            ) as proc:
+                assert proc.stdin and proc.stdout
+                jobs = [
+                    {"id": None, "cmd": "ping"},
+                    {"id": "a", "input": str(img_a), "emit_dir": str(shared_emit), "mode": "original", "auto_crop": False},
+                    {"id": "b", "input": str(img_b), "emit_dir": str(shared_emit), "mode": "original", "auto_crop": False},
+                    {"id": None, "input": str(img_a), "emit_dir": None},
+                    {"id": "miss", "input": str(d / "missing.png"), "emit_dir": str(shared_emit), "crop_engine": "vision"},
+                    {"id": "pdf", "input": str(pdf_file), "emit_dir": str(shared_emit), "crop_engine": "vision"},
+                    {"id": "txt", "input": str(txt_file), "emit_dir": str(shared_emit), "crop_engine": "vision"},
+                    {"id": "quit", "cmd": "quit"},
+                ]
+                for job in jobs:
+                    proc.stdin.write(json.dumps(job) + "\n")
+                proc.stdin.flush()
+                resps = [json.loads(proc.stdout.readline()) for _ in jobs]
+                proc.wait(timeout=15)
+                self.assertEqual(proc.returncode, 0)
+
+            self.assertEqual(resps[0]["id"], "")
+            self.assertEqual(resps[0]["status"], "pong")
+            self.assertEqual(resps[1]["status"], "ok")
+            self.assertEqual(resps[2]["status"], "ok")
+            self.assertNotEqual(resps[1]["output"], resps[2]["output"])
+            self.assertTrue(Path(resps[1]["output"]).exists())
+            self.assertTrue(Path(resps[2]["output"]).exists())
+            self.assertIn("2026", Path(resps[1]["output"]).name)  # Not truncated at " ("
+            self.assertEqual(resps[3]["status"], "error")
+            self.assertEqual(resps[3]["id"], "")
+            self.assertFalse((d / "None").exists())
+            for idx in (4, 5, 6):
+                self.assertEqual(resps[idx]["status"], "error")
+                self.assertNotIn("Vision helper", resps[idx]["message"])
+
+            # Verify crop_via_vision is never invoked for missing, .pdf, or non-image inputs
+            import io
+            from unittest import mock
+
+            in_lines = "\n".join(
+                json.dumps(j)
+                for j in [
+                    {"id": "m", "input": str(d / "missing.png"), "emit_dir": str(shared_emit), "crop_engine": "vision"},
+                    {"id": "p", "input": str(pdf_file), "emit_dir": str(shared_emit), "crop_engine": "vision"},
+                    {"id": "t", "input": str(txt_file), "emit_dir": str(shared_emit), "crop_engine": "vision"},
+                    {"id": "q", "cmd": "quit"},
+                ]
+            ) + "\n"
+            fake_out = io.StringIO()
+            with (
+                mock.patch("batch_scanner.crop_via_vision") as m_vis,
+                mock.patch("sys.stdin", io.StringIO(in_lines)),
+                mock.patch("sys.stdout", fake_out),
+            ):
+                rc = batch_scanner.run_worker_stdio()
+            self.assertEqual(rc, 0)
+            m_vis.assert_not_called()
+
+            # downscale_to_dpi clamps >= 72 and falls back unknown page_size -> a4
+            tall = np.full((3000, 2200, 3), 240, dtype=np.uint8)
+            ds_10 = batch_scanner.downscale_to_dpi(tall, "a4", dpi=10, margin=20.0)
+            ds_72 = batch_scanner.downscale_to_dpi(tall, "a4", dpi=72, margin=20.0)
+            self.assertEqual(ds_10.shape, ds_72.shape)
+            ds_unk = batch_scanner.downscale_to_dpi(tall, "unknown_size", dpi=150, margin=20.0)
+            ds_a4 = batch_scanner.downscale_to_dpi(tall, "a4", dpi=150, margin=20.0)
+            self.assertEqual(ds_unk.shape, ds_a4.shape)
+
+            # scan_to_pdf.process_image_to_scanned returns consistent '1' mode for bw regardless of auto_crop
+            bw_doc = _make_doc_image(800, 1000, with_border=True)
+            bw_src = d / "bw_src.png"
+            cv2.imwrite(str(bw_src), bw_doc)
+            im_nocrop = scan_to_pdf.process_image_to_scanned(str(bw_src), enhance_mode="bw", auto_crop=False)
+            im_crop = scan_to_pdf.process_image_to_scanned(str(bw_src), enhance_mode="bw", auto_crop=True)
+            self.assertEqual(im_nocrop.mode, "1")
+            self.assertEqual(im_crop.mode, "1")
 
 
 if __name__ == "__main__":

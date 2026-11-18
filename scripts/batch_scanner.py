@@ -13,6 +13,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
+import uuid
 import zlib
 from pathlib import Path
 
@@ -90,6 +92,40 @@ _KERNEL_13x2 = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 13))
 _KERNEL_31x31 = cv2.getStructuringElement(cv2.MORPH_RECT, (31, 31))
 
 
+def _canonical_path(path: str | os.PathLike[str]) -> str:
+    """Return resolved realpath normalized to Unicode NFC for APFS/Vision parity."""
+    return unicodedata.normalize("NFC", os.path.realpath(os.fspath(path)))
+
+
+def _atomic_write_bytes(dest_path: str | os.PathLike[str], writer_fn) -> str:
+    """Write bytes via an unpredictable temp file in the destination dir and atomically replace."""
+    out_abs = os.path.abspath(os.fspath(dest_path))
+    out_dir = os.path.dirname(out_abs) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    base = os.path.basename(out_abs)
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=out_dir,
+            prefix=f".{base}.",
+            suffix=".tmp",
+            delete=False,
+        ) as fp:
+            tmp_path = fp.name
+            writer_fn(fp)
+        os.replace(tmp_path, out_abs)
+        tmp_path = None
+        return out_abs
+    except BaseException:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise
+
+
 def _natural_sort_key(filename: str):
     """Sort filenames naturally so page2.jpg comes before page10.jpg."""
     return [int(token) if token.isdigit() else token.lower() for token in re.split(r"(\d+)", filename)]
@@ -114,10 +150,33 @@ def find_images(input_path: str) -> list[str]:
 
 
 def _pil_to_bgr(pil_img: Image.Image) -> np.ndarray:
-    """Apply EXIF orientation, flatten transparency over white, and convert PIL image to OpenCV BGR."""
+    """Apply EXIF orientation, scale 16-bit/int gray, flatten transparency over white, and convert to BGR."""
     transposed = ImageOps.exif_transpose(pil_img)
-    if transposed.mode in ("RGBA", "LA") or (
-        transposed.mode == "P" and "transparency" in transposed.info
+    if transposed.mode in ("I;16", "I;16B", "I;16L", "I;16N"):
+        arr16 = np.asarray(transposed).astype(np.uint16)
+        arr8 = (arr16 >> 8).astype(np.uint8)
+        if isinstance(transposed.info.get("transparency"), int):
+            arr8 = np.where(arr16 == transposed.info["transparency"], 255, arr8).astype(np.uint8)
+        return cv2.cvtColor(arr8, cv2.COLOR_GRAY2BGR)
+    if transposed.mode == "I":
+        arr_i = np.asarray(transposed, dtype=np.int64)
+        if arr_i.size == 0:
+            return np.zeros((0, 0, 3), dtype=np.uint8)
+        max_v, min_v = int(arr_i.max()), int(arr_i.min())
+        if max_v > 65535 or min_v < 0:
+            span = max_v - min_v
+            arr8 = (
+                np.clip((arr_i - min_v) * (255.0 / span), 0, 255).astype(np.uint8)
+                if span > 0
+                else np.zeros(arr_i.shape, dtype=np.uint8)
+            )
+        elif max_v > 255:
+            arr8 = (arr_i >> 8).astype(np.uint8)
+        else:
+            arr8 = arr_i.astype(np.uint8)
+        return cv2.cvtColor(arr8, cv2.COLOR_GRAY2BGR)
+    if transposed.mode in ("RGBA", "LA", "PA") or (
+        transposed.info.get("transparency") is not None
     ):
         rgba = transposed.convert("RGBA")
         white_bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
@@ -933,12 +992,13 @@ def downscale_to_dpi(image: np.ndarray, page_size: str, dpi: int, margin: float)
     """Downscale image to fit within target page size and DPI without upscaling."""
     if page_size == "fit":
         return image
-    w_pt, h_pt = (595.28, 841.89) if page_size == "a4" else (612.0, 792.0)
+    effective_dpi = float(max(72, int(dpi)))
+    w_pt, h_pt = (612.0, 792.0) if page_size == "letter" else (595.28, 841.89)
     h, w = image.shape[:2]
     if w > h:
         w_pt, h_pt = h_pt, w_pt
-    avail_w_px = max(100.0, (w_pt - 2.0 * margin) * dpi / 72.0)
-    avail_h_px = max(100.0, (h_pt - 2.0 * margin) * dpi / 72.0)
+    avail_w_px = max(100.0, (w_pt - 2.0 * margin) * effective_dpi / 72.0)
+    avail_h_px = max(100.0, (h_pt - 2.0 * margin) * effective_dpi / 72.0)
     scale = min(1.0, avail_w_px / max(w, 1), avail_h_px / max(h, 1))
     if scale >= 0.99:
         return image
@@ -1224,18 +1284,7 @@ def assemble_pdf_from_pages(
         page[NameObject("/Contents")] = writer._add_object(content)
         writer.add_page(page)
 
-    out_abs = os.path.abspath(output_pdf_path)
-    out_dir = os.path.dirname(out_abs)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-    tmp_out = f"{out_abs}.tmp.{os.getpid()}"
-    try:
-        with open(tmp_out, "wb") as fp:
-            writer.write(fp)
-        os.replace(tmp_out, out_abs)
-    finally:
-        if os.path.exists(tmp_out):
-            os.remove(tmp_out)
+    _atomic_write_bytes(output_pdf_path, writer.write)
 
 
 def assemble_pdf_from_jpegs(
@@ -1295,22 +1344,28 @@ def crop_via_vision(
 
     if manifest_file.exists():
         meta = json.loads(manifest_file.read_text(encoding="utf-8"))
-        return {os.path.realpath(entry["input"]): entry for entry in meta.get("results", [])}
+        return {
+            _canonical_path(entry["input"]): entry
+            for entry in meta.get("results", [])
+            if entry.get("input")
+        }
 
     if proc.returncode != 0:
         raise RuntimeError(f"Vision crop failed: {proc.stderr.strip()}")
 
     meta = json.loads(proc.stdout)
-    return {os.path.realpath(entry["input"]): entry for entry in meta.get("results", [])}
+    return {
+        _canonical_path(entry["input"]): entry
+        for entry in meta.get("results", [])
+        if entry.get("input")
+    }
 
 
 def _write_manifest(manifest_path: Path | None, payload: dict) -> None:
     if manifest_path is None:
         return
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp_path, manifest_path)
+    data = json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
+    _atomic_write_bytes(manifest_path, lambda fp: fp.write(data))
 
 
 def _make_task_entry(
@@ -1347,7 +1402,7 @@ def _discover_page_tasks(files: list[str], use_vision: bool, tmp_dir: Path) -> l
 
     for fpath in files:
         fname = os.path.basename(fpath)
-        canon_fpath = os.path.realpath(fpath)
+        canon_fpath = _canonical_path(fpath)
         ext_lower = os.path.splitext(fname)[1].lower()
 
         if ext_lower == ".pdf":
@@ -1359,7 +1414,7 @@ def _discover_page_tasks(files: list[str], use_vision: bool, tmp_dir: Path) -> l
                     tmp_img = tmp_dir / f"pdf_{seq:04d}.png"
                     cv2.imwrite(str(tmp_img), bgr)
                     del bgr
-                    canon_tmp = os.path.realpath(str(tmp_img))
+                    canon_tmp = _canonical_path(tmp_img)
                     tasks.append(
                         _make_task_entry(
                             len(tasks),
@@ -1408,7 +1463,7 @@ def _discover_page_tasks(files: list[str], use_vision: bool, tmp_dir: Path) -> l
                             tmp_img = tmp_dir / f"tiff_{seq:04d}.png"
                             cv2.imwrite(str(tmp_img), bgr)
                             del bgr
-                            canon_tmp = os.path.realpath(str(tmp_img))
+                            canon_tmp = _canonical_path(tmp_img)
                             tasks.append(
                                 _make_task_entry(
                                     len(tasks),
@@ -1592,14 +1647,16 @@ def _process_single_page_task(task: dict, config: dict) -> dict:
     pil_page = _bgr_to_pil(img, canon_mode)
     del img
 
-    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", label.split(" (")[0]).strip("_") or f"page_{idx + 1}"
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", label).strip("_") or f"page_{idx + 1}"
     is_bw_1bit = pil_page.mode == "1"
     ext = "png" if is_bw_1bit else "jpg"
     emit_dir_path = Path(config["emit_dir"]) if config["emit_dir"] else None
     tmp_dir_path = Path(config["tmp_dir"])
     debug_dir = Path(config["debug_dir"]) if config["debug_dir"] else None
 
-    out_path = (emit_dir_path or tmp_dir_path) / f"{idx + 1:04d}_{stem}_{canon_mode}.{ext}"
+    emit_tag = config.get("emit_tag")
+    file_prefix = f"{idx + 1:04d}_{emit_tag}_" if emit_tag else f"{idx + 1:04d}_"
+    out_path = (emit_dir_path or tmp_dir_path) / f"{file_prefix}{stem}_{canon_mode}.{ext}"
     if is_bw_1bit:
         pil_page.save(out_path, format="PNG", optimize=True)
         page_fmt = "png_1bit"
@@ -1623,9 +1680,9 @@ def _process_single_page_task(task: dict, config: dict) -> dict:
     if debug_dir is not None:
         debug_file = debug_dir / f"{idx + 1:02d}_{stem}_{canon_mode}.{ext}"
         shutil.copy2(out_path, debug_file)
-        debug_out_path = str(debug_file.resolve())
+        debug_out_path = _canonical_path(debug_file)
 
-    emitted_out = str(out_path.resolve()) if emit_dir_path is not None else debug_out_path
+    emitted_out = _canonical_path(out_path) if emit_dir_path is not None else debug_out_path
     return {
         "manifest": {
             "index": idx,
@@ -1746,7 +1803,7 @@ def convert_folder_to_hd_pdf(
                 for t in tasks:
                     vi = t.get("vision_input")
                     if vi:
-                        t["vision_meta"] = vision_results.get(vi)
+                        t["vision_meta"] = vision_results.get(_canonical_path(vi))
 
         config = {
             "total_items": len(tasks),
@@ -1979,10 +2036,26 @@ def run_worker_stdio() -> int:
     _init_worker()
     vision_cmd, _ = resolve_vision_helper()
     has_vision = sys.platform == "darwin" and bool(vision_cmd)
+    valid_modes = {"auto_color", "clean", "bw", "grayscale", "original"}
+    job_seq = 0
 
     def _reply(obj: dict) -> None:
         sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
         sys.stdout.flush()
+
+    def _reply_error(rid: str, msg: str) -> None:
+        _reply(
+            {
+                "id": rid,
+                "status": "error",
+                "output": None,
+                "message": msg,
+                "method": "none",
+                "confidence": 0.0,
+                "width": 0,
+                "height": 0,
+            }
+        )
 
     while True:
         raw_line = sys.stdin.readline()
@@ -1996,9 +2069,10 @@ def run_worker_stdio() -> int:
         try:
             req = json.loads(line)
             if not isinstance(req, dict):
-                _reply({"status": "error", "id": "", "message": "Invalid JSON object request"})
+                _reply_error("", "Invalid JSON object request")
                 continue
-            req_id = str(req.get("id", ""))
+            raw_id = req.get("id")
+            req_id = "" if raw_id is None else str(raw_id)
             cmd = req.get("cmd")
             if cmd == "ping":
                 _reply({"status": "pong", "id": req_id})
@@ -2007,9 +2081,39 @@ def run_worker_stdio() -> int:
                 _reply({"status": "bye", "id": req_id})
                 break
 
-            input_file = str(req["input"])
-            emit_dir = str(req["emit_dir"])
-            emit_dir_path = Path(emit_dir)
+            raw_input = req.get("input")
+            if not isinstance(raw_input, str) or not raw_input.strip():
+                _reply_error(req_id, "Missing or null input path")
+                continue
+
+            raw_emit_dir = req.get("emit_dir")
+            if not isinstance(raw_emit_dir, str) or not raw_emit_dir.strip():
+                _reply_error(req_id, "Missing or null emit_dir")
+                continue
+
+            canon_mode = normalize_enhance_mode(str(req.get("mode", "auto_color")))
+            if canon_mode not in valid_modes:
+                _reply_error(req_id, f"Unsupported enhance mode: {canon_mode}")
+                continue
+
+            canon_input = _canonical_path(raw_input)
+            if not os.path.isfile(canon_input):
+                _reply_error(req_id, f"Input file not found: {raw_input}")
+                continue
+            if (
+                os.path.splitext(raw_input)[1].lower() == ".pdf"
+                or os.path.splitext(canon_input)[1].lower() == ".pdf"
+            ):
+                _reply_error(req_id, "PDF inputs are not supported in single-page --worker-stdio mode")
+                continue
+            try:
+                with Image.open(canon_input) as probe_im:
+                    _ = probe_im.format
+            except Exception as exc:
+                _reply_error(req_id, f"Failed to load image: {exc}")
+                continue
+
+            emit_dir_path = Path(raw_emit_dir).expanduser()
             emit_dir_path.mkdir(parents=True, exist_ok=True)
 
             auto_crop = bool(req.get("auto_crop", True))
@@ -2017,16 +2121,17 @@ def run_worker_stdio() -> int:
             use_vision = auto_crop and (
                 crop_engine == "vision" or (crop_engine == "auto" and has_vision)
             )
-            canon_input = os.path.realpath(input_file)
             min_conf = float(req.get("min_confidence", 0.45))
+            job_seq += 1
 
             with tempfile.TemporaryDirectory(prefix="pdfscanner_w_") as td:
                 tmp_dir = Path(td)
+                fname = unicodedata.normalize("NFC", os.path.basename(raw_input)) or os.path.basename(canon_input)
                 task = _make_task_entry(
                     index=0,
                     canon_fpath=canon_input,
-                    fname=os.path.basename(input_file),
-                    label=os.path.basename(input_file),
+                    fname=fname,
+                    label=fname,
                     kind="image",
                     load_path=canon_input,
                     vision_input=canon_input if use_vision else None,
@@ -2040,7 +2145,7 @@ def run_worker_stdio() -> int:
 
                 config = {
                     "total_items": 1,
-                    "canon_mode": normalize_enhance_mode(str(req.get("mode", "auto_color"))),
+                    "canon_mode": canon_mode,
                     "auto_crop": auto_crop,
                     "use_vision": use_vision,
                     "page_size": str(req.get("page_size", "a4")),
@@ -2051,6 +2156,7 @@ def run_worker_stdio() -> int:
                     "balance_symmetry": bool(req.get("balance_symmetry", False)),
                     "jpeg_quality": max(1, min(100, int(req.get("jpeg_quality", 86)))),
                     "emit_dir": str(emit_dir_path),
+                    "emit_tag": f"w{job_seq:04d}_{uuid.uuid4().hex[:6]}",
                     "tmp_dir": str(tmp_dir),
                     "debug_dir": None,
                 }
@@ -2059,18 +2165,7 @@ def run_worker_stdio() -> int:
                 manifest["id"] = req_id
                 _reply(manifest)
         except Exception as exc:
-            _reply(
-                {
-                    "id": req_id,
-                    "status": "error",
-                    "output": None,
-                    "message": str(exc),
-                    "method": "none",
-                    "confidence": 0.0,
-                    "width": 0,
-                    "height": 0,
-                }
-            )
+            _reply_error(req_id, str(exc))
         finally:
             gc.collect()
 

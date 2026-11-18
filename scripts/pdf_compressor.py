@@ -5,9 +5,12 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import math
 import os
+import shutil
 import sys
 import tempfile
+import zlib
 from pathlib import Path
 
 import cv2
@@ -15,6 +18,7 @@ import numpy as np
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import (
+    ContentStream,
     EncodedStreamObject,
     IndirectObject,
     NameObject,
@@ -67,25 +71,125 @@ def _iter_resource_xobjects(resources, seen_forms: set[int], prefix: tuple[str, 
 
 
 def _classify_page(page) -> tuple[bool, int]:
-    """Return (has_font, max_image_pixels) for page classification."""
+    """Return (has_font, total_image_pixels) for page classification."""
     has_font = _page_has_fonts(page)
-    max_px = 0
+    sum_px = 0
     for _, _, stream in _iter_resource_xobjects(page.get("/Resources"), set()):
         w = int(stream.get("/Width", 0) or 0)
         h = int(stream.get("/Height", 0) or 0)
-        max_px = max(max_px, w * h)
-    return has_font, max_px
+        sum_px += max(0, w) * max(0, h)
+    return has_font, sum_px
 
 
 def _page_size_inches(page) -> tuple[float, float]:
     box = page.cropbox if page.cropbox is not None else page.mediabox
     w_pt = max(1.0, abs(float(box.right) - float(box.left)))
     h_pt = max(1.0, abs(float(box.top) - float(box.bottom)))
-    return w_pt / 72.0, h_pt / 72.0
+    user_unit = float(page.get("/UserUnit", 1.0) or 1.0)
+    if user_unit <= 0:
+        user_unit = 1.0
+    rotate = int(page.get("/Rotate", 0) or 0) % 360
+    if rotate in (90, 270):
+        w_pt, h_pt = h_pt, w_pt
+    return (w_pt * user_unit) / 72.0, (h_pt * user_unit) / 72.0
+
+
+def _mul_matrix(m1: tuple[float, ...], m2: tuple[float, ...]) -> tuple[float, float, float, float, float, float]:
+    a1, b1, c1, d1, e1, f1 = m1
+    a2, b2, c2, d2, e2, f2 = m2
+    return (
+        a1 * a2 + b1 * c2,
+        a1 * b2 + b1 * d2,
+        c1 * a2 + d1 * c2,
+        c1 * b2 + d1 * d2,
+        e1 * a2 + f1 * c2 + e2,
+        e1 * b2 + f1 * d2 + f2,
+    )
+
+
+def _collect_xobject_draw_boxes_inches(page) -> dict[tuple[str, ...], tuple[float, float]]:
+    """Map XObject key_path -> rendered (width_in, height_in) from page and nested /Form CTMs."""
+    user_unit = float(page.get("/UserUnit", 1.0) or 1.0)
+    if user_unit <= 0:
+        user_unit = 1.0
+    boxes: dict[tuple[str, ...], tuple[float, float]] = {}
+
+    def _walk(
+        content_obj,
+        resources_obj,
+        init_ctm: tuple[float, float, float, float, float, float],
+        prefix: tuple[str, ...],
+        seen_forms: frozenset[int],
+    ) -> None:
+        if content_obj is None:
+            return
+        res_dict = _deref(resources_obj)
+        xobjs = _deref(res_dict.get("/XObject")) if isinstance(res_dict, dict) else None
+        if not isinstance(xobjs, dict):
+            return
+        try:
+            ops = ContentStream(content_obj, page.pdf).operations
+        except Exception:
+            return
+
+        ctm = init_ctm
+        stack: list[tuple[float, float, float, float, float, float]] = []
+        for operands, op in ops:
+            if op == b"q":
+                stack.append(ctm)
+            elif op == b"Q":
+                if stack:
+                    ctm = stack.pop()
+            elif op == b"cm" and len(operands) >= 6:
+                try:
+                    m = tuple(float(v) for v in operands[:6])
+                    ctm = _mul_matrix(m, ctm)
+                except (TypeError, ValueError):
+                    pass
+            elif op == b"Do" and operands:
+                name = str(operands[0])
+                raw_ref = xobjs.get(name)
+                if raw_ref is None:
+                    continue
+                stream = _deref(raw_ref)
+                if not hasattr(stream, "get"):
+                    continue
+                subtype = str(stream.get("/Subtype", ""))
+                key_path = prefix + (name,)
+                if subtype == "/Image":
+                    w_in = math.hypot(ctm[0], ctm[1]) * user_unit / 72.0
+                    h_in = math.hypot(ctm[2], ctm[3]) * user_unit / 72.0
+                    if w_in > 0.05 and h_in > 0.05:
+                        prev = boxes.get(key_path)
+                        if prev is None or (w_in * h_in) > (prev[0] * prev[1]):
+                            boxes[key_path] = (w_in, h_in)
+                elif subtype == "/Form":
+                    obj_id = raw_ref.idnum if isinstance(raw_ref, IndirectObject) else id(stream)
+                    if obj_id in seen_forms:
+                        continue
+                    form_mat_raw = _deref(stream.get("/Matrix"))
+                    sub_ctm = ctm
+                    if isinstance(form_mat_raw, (list, tuple)) and len(form_mat_raw) >= 6:
+                        try:
+                            fm = tuple(float(v) for v in form_mat_raw[:6])
+                            sub_ctm = _mul_matrix(fm, ctm)
+                        except (TypeError, ValueError):
+                            pass
+                    _walk(
+                        stream,
+                        stream.get("/Resources") or resources_obj,
+                        sub_ctm,
+                        key_path,
+                        seen_forms | {obj_id},
+                    )
+
+    _walk(page.get_contents(), page.get("/Resources"), (1.0, 0.0, 0.0, 1.0, 0.0, 0.0), (), frozenset())
+    return boxes
 
 
 def _decode_xobject_pil(page, key_path: tuple[str, ...], stream) -> Image.Image | None:
     """Decode a PDF image XObject into a PIL Image using pypdf's page image decoder first."""
+    first_exc: Exception | None = None
     try:
         lookup = key_path[0] if len(key_path) == 1 else key_path
         img_file = page.images[lookup]
@@ -95,13 +199,18 @@ def _decode_xobject_pil(page, key_path: tuple[str, ...], stream) -> Image.Image 
             with Image.open(io.BytesIO(img_file.data)) as im:
                 im.load()
                 return im.copy()
-    except Exception:
-        pass
+    except Exception as exc:
+        first_exc = exc
     try:
         with Image.open(io.BytesIO(stream.get_data())) as im:
             im.load()
             return im.copy()
-    except Exception:
+    except Exception as exc:
+        batch_scanner.logger.warning(
+            "Failed to decode embedded image %s: %s",
+            "/".join(key_path),
+            first_exc or exc,
+        )
         return None
 
 
@@ -111,19 +220,20 @@ def _recompress_image_stream_in_place(
     stream,
     page_w_in: float,
     page_h_in: float,
+    draw_box_in: tuple[float, float] | None,
     target_dpi: int,
     jpeg_quality: int,
     enhance_mode: str,
     auto_crop: bool,
 ) -> bool:
-    """Re-encode an embedded /Image XObject in place as optimized JPEG (no orphaned objects)."""
+    """Re-encode an embedded /Image XObject in place as JPEG or 1-bit Flate (no orphaned objects)."""
     if stream.get("/ImageMask") is True or stream.get("/SMask") is not None or stream.get("/Mask") is not None:
         return False
 
     bpc = int(stream.get("/BitsPerComponent", 8) or 8)
     orig_w = int(stream.get("/Width", 0) or 0)
     orig_h = int(stream.get("/Height", 0) or 0)
-    if bpc < 8 or orig_w * orig_h < 64_000:
+    if (bpc < 8 and enhance_mode == "original" and not auto_crop) or orig_w * orig_h < 64_000:
         return False
 
     pil_img = _decode_xobject_pil(page, key_path, stream)
@@ -131,8 +241,25 @@ def _recompress_image_stream_in_place(
         return False
 
     try:
-        cur_w, cur_h = pil_img.size
-        eff_dpi = max(cur_w / max(page_w_in, 0.5), cur_h / max(page_h_in, 0.5))
+        bgr: np.ndarray | None = None
+        if enhance_mode != "original" or auto_crop:
+            bgr = batch_scanner._pil_to_bgr(pil_img)
+            if auto_crop:
+                bgr = batch_scanner.detect_and_crop(bgr)
+            if enhance_mode != "original":
+                bgr = batch_scanner.enhance_image_bgr(bgr, mode=enhance_mode)
+            cur_h, cur_w = bgr.shape[:2]
+        else:
+            cur_w, cur_h = pil_img.size
+
+        if draw_box_in is not None:
+            box_w_in, box_h_in = draw_box_in
+        else:
+            box_w_in, box_h_in = page_w_in, page_h_in
+            if (cur_w > cur_h) != (box_w_in > box_h_in):
+                box_w_in, box_h_in = box_h_in, box_w_in
+
+        eff_dpi = max(cur_w / max(box_w_in, 0.5), cur_h / max(box_h_in, 0.5))
         needs_resize = eff_dpi > (target_dpi * 1.04)
         new_w, new_h = cur_w, cur_h
         if needs_resize:
@@ -140,47 +267,70 @@ def _recompress_image_stream_in_place(
             new_w = max(32, int(round(cur_w * scale)))
             new_h = max(32, int(round(cur_h * scale)))
 
-        work_pil = pil_img
-        if enhance_mode != "original" or auto_crop:
-            bgr = batch_scanner._pil_to_bgr(work_pil)
-            if auto_crop:
-                bgr = batch_scanner.detect_and_crop(bgr)
-            if enhance_mode != "original":
-                bgr = batch_scanner.enhance_image_bgr(bgr, mode=enhance_mode)
+        if bgr is not None:
             if needs_resize:
                 bgr = cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
             canon = batch_scanner.normalize_enhance_mode(enhance_mode)
             work_pil = batch_scanner._bgr_to_pil(bgr, canon)
         elif needs_resize:
-            work_pil = work_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
-
-        if work_pil.mode == "1":
-            work_pil = work_pil.convert("L")
-        elif work_pil.mode not in ("RGB", "L"):
-            if "A" in work_pil.mode:
-                bg = Image.new("RGB", work_pil.size, (255, 255, 255))
-                rgba = work_pil.convert("RGBA")
-                bg.paste(rgba, mask=rgba.split()[-1])
-                work_pil = bg
+            if pil_img.mode == "1":
+                work_pil = pil_img.convert("L").resize((new_w, new_h), Image.Resampling.LANCZOS).convert(
+                    "1", dither=Image.Dither.NONE
+                )
             else:
-                work_pil = work_pil.convert("RGB")
-
-        buf = io.BytesIO()
-        work_pil.save(buf, format="JPEG", quality=jpeg_quality, optimize=True, progressive=False)
-        jpeg_bytes = buf.getvalue()
+                work_pil = pil_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        else:
+            work_pil = pil_img
 
         orig_stream_len = len(getattr(stream, "_data", b"") or b"")
-        if orig_stream_len > 0 and not needs_resize and enhance_mode == "original" and len(jpeg_bytes) >= orig_stream_len:
-            return False
-
         out_w, out_h = work_pil.size
-        cs = NameObject("/DeviceGray") if work_pil.mode == "L" else NameObject("/DeviceRGB")
 
-        # Mutate the cloned stream object directly in-place inside the writer so old streams are overwritten, not orphaned
-        stream.__class__ = EncodedStreamObject
-        stream.clear()
-        stream.update(
-            {
+        if work_pil.mode == "1":
+            out_bytes = zlib.compress(work_pil.tobytes(), level=9)
+            if (
+                orig_stream_len > 0
+                and bpc == 1
+                and not needs_resize
+                and not auto_crop
+                and len(out_bytes) >= orig_stream_len
+            ):
+                return False
+            stream_meta = {
+                NameObject("/Type"): NameObject("/XObject"),
+                NameObject("/Subtype"): NameObject("/Image"),
+                NameObject("/Width"): NumberObject(out_w),
+                NameObject("/Height"): NumberObject(out_h),
+                NameObject("/ColorSpace"): NameObject("/DeviceGray"),
+                NameObject("/BitsPerComponent"): NumberObject(1),
+                NameObject("/Filter"): NameObject("/FlateDecode"),
+                NameObject("/Length"): NumberObject(len(out_bytes)),
+            }
+        else:
+            if work_pil.mode in ("I;16", "I;16B", "I;16L", "I;16N", "I"):
+                bgr16 = batch_scanner._pil_to_bgr(work_pil)
+                work_pil = Image.fromarray(cv2.cvtColor(bgr16, cv2.COLOR_BGR2GRAY), mode="L")
+            elif work_pil.mode not in ("RGB", "L"):
+                if "A" in work_pil.mode or work_pil.info.get("transparency") is not None:
+                    rgba = work_pil.convert("RGBA")
+                    bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+                    work_pil = Image.alpha_composite(bg, rgba).convert("RGB")
+                else:
+                    work_pil = work_pil.convert("RGB")
+
+            buf = io.BytesIO()
+            work_pil.save(buf, format="JPEG", quality=jpeg_quality, optimize=True, progressive=False)
+            out_bytes = buf.getvalue()
+            if (
+                orig_stream_len > 0
+                and not needs_resize
+                and enhance_mode == "original"
+                and not auto_crop
+                and len(out_bytes) >= orig_stream_len
+            ):
+                return False
+
+            cs = NameObject("/DeviceGray") if work_pil.mode == "L" else NameObject("/DeviceRGB")
+            stream_meta = {
                 NameObject("/Type"): NameObject("/XObject"),
                 NameObject("/Subtype"): NameObject("/Image"),
                 NameObject("/Width"): NumberObject(out_w),
@@ -188,10 +338,14 @@ def _recompress_image_stream_in_place(
                 NameObject("/ColorSpace"): cs,
                 NameObject("/BitsPerComponent"): NumberObject(8),
                 NameObject("/Filter"): NameObject("/DCTDecode"),
-                NameObject("/Length"): NumberObject(len(jpeg_bytes)),
+                NameObject("/Length"): NumberObject(len(out_bytes)),
             }
-        )
-        stream._data = jpeg_bytes
+
+        # Mutate the cloned stream object directly in-place inside the writer so old streams are overwritten, not orphaned
+        stream.__class__ = EncodedStreamObject
+        stream.clear()
+        stream.update(stream_meta)
+        stream._data = out_bytes
         return True
     finally:
         pil_img.close()
@@ -206,6 +360,14 @@ def _compress_once(
     auto_crop: bool,
 ) -> dict:
     reader = PdfReader(source_pdf)
+    if reader.is_encrypted:
+        try:
+            decrypted = reader.decrypt("")
+        except Exception:
+            decrypted = 0
+        if not decrypted:
+            raise ValueError(f"Input PDF is password-protected/encrypted: {source_pdf}")
+
     writer = PdfWriter()
     vector_pages = 0
     image_pages = 0
@@ -213,15 +375,16 @@ def _compress_once(
     seen_xobj_ids: set[int] = set()
 
     for page in reader.pages:
-        has_font, max_px = _classify_page(page)
+        has_font, sum_px = _classify_page(page)
         page_w_in, page_h_in = _page_size_inches(page)
 
         # Preserve pure vector/text pages untouched (no rasterization!)
-        if has_font and max_px < 300_000:
+        if has_font and sum_px < 300_000:
             writer.add_page(page)
             vector_pages += 1
             continue
 
+        draw_boxes = _collect_xobject_draw_boxes_inches(page)
         added_page = writer.add_page(page)
         page_modified = False
         for key_path, raw_ref, stream in _iter_resource_xobjects(added_page.get("/Resources"), set()):
@@ -236,6 +399,7 @@ def _compress_once(
                 stream=stream,
                 page_w_in=page_w_in,
                 page_h_in=page_h_in,
+                draw_box_in=draw_boxes.get(key_path),
                 target_dpi=target_dpi,
                 jpeg_quality=jpeg_quality,
                 enhance_mode=enhance_mode,
@@ -247,23 +411,12 @@ def _compress_once(
 
         if has_font and not page_modified:
             vector_pages += 1
-        elif page_modified or max_px > 0:
+        elif page_modified or sum_px > 0:
             image_pages += 1
         else:
             vector_pages += 1
 
-    # Remove unreferenced objects if supported and write atomically
-    out_abs = os.path.abspath(dest_pdf)
-    os.makedirs(os.path.dirname(out_abs), exist_ok=True)
-    tmp_out = f"{out_abs}.tmp.{os.getpid()}"
-    try:
-        with open(tmp_out, "wb") as fp:
-            writer.write(fp)
-        os.replace(tmp_out, out_abs)
-    finally:
-        if os.path.exists(tmp_out):
-            os.remove(tmp_out)
-
+    out_abs = batch_scanner._atomic_write_bytes(dest_pdf, writer.write)
     return {
         "pages": len(reader.pages),
         "vector_pages": vector_pages,
@@ -271,6 +424,14 @@ def _compress_once(
         "recompressed_images": recompressed_images,
         "after_bytes": os.path.getsize(out_abs),
     }
+
+
+def _atomic_copy_file(src_path: str | os.PathLike[str], dest_path: str | os.PathLike[str]) -> None:
+    def _copy(fp) -> None:
+        with open(src_path, "rb") as src_fp:
+            shutil.copyfileobj(src_fp, fp)
+
+    batch_scanner._atomic_write_bytes(dest_path, _copy)
 
 
 def compress_pdf(
@@ -283,7 +444,7 @@ def compress_pdf(
     auto_crop: bool = False,
 ) -> dict:
     """Compress embedded scan images while preserving vector text pages and original MediaBoxes."""
-    if not os.path.exists(source_pdf):
+    if not os.path.isfile(source_pdf):
         raise FileNotFoundError(f"Input PDF not found: {source_pdf}")
 
     before_bytes = os.path.getsize(source_pdf)
@@ -291,70 +452,102 @@ def compress_pdf(
     target_bytes = int(target_mb * 1024 * 1024) if target_mb > 0 else 0
     base_dpi = max(72, int(dpi))
     base_q = max(35, min(95, int(jpeg_quality)))
+    same_in_out = batch_scanner._canonical_path(source_pdf) == batch_scanner._canonical_path(output_pdf)
 
-    # Initial pass at user's chosen DPI & quality
-    stats = _compress_once(
-        source_pdf=source_pdf,
-        dest_pdf=output_pdf,
-        target_dpi=base_dpi,
-        jpeg_quality=base_q,
-        enhance_mode=canon_mode,
-        auto_crop=auto_crop,
-    )
-    used_dpi = base_dpi
-    used_q = base_q
+    with tempfile.TemporaryDirectory(prefix="pdfcomp_") as td:
+        td_path = Path(td)
+        staged_source = td_path / "source.pdf"
+        shutil.copy2(source_pdf, staged_source)
 
-    if target_bytes > 0 and stats["after_bytes"] > target_bytes and stats["recompressed_images"] > 0:
-        with tempfile.TemporaryDirectory(prefix="pdfcomp_") as td:
-            # Candidate grid ordered from highest readability down to minimum readable preset
-            candidates: list[tuple[int, int]] = []
-            for d_cand in sorted({base_dpi, min(base_dpi, 125), min(base_dpi, 100), 85}, reverse=True):
-                for q_cand in (75, 62, 50, 40, 35):
-                    if d_cand == base_dpi and q_cand >= base_q:
-                        continue
-                    candidates.append((d_cand, q_cand))
+        init_path = td_path / "init.pdf"
+        stats = _compress_once(
+            source_pdf=str(staged_source),
+            dest_pdf=str(init_path),
+            target_dpi=base_dpi,
+            jpeg_quality=base_q,
+            enhance_mode=canon_mode,
+            auto_crop=auto_crop,
+        )
+        used_dpi = base_dpi
+        used_q = base_q
+        chosen_path = init_path
 
-            # Binary search along monotonic quality/DPI degradation ladder when possible; fallback linear refine
-            lo, hi = 0, len(candidates) - 1
+        if target_bytes > 0 and stats["after_bytes"] > target_bytes and stats["recompressed_images"] > 0:
+            dpi_levels = sorted(
+                {d for d in (base_dpi, min(base_dpi, 125), min(base_dpi, 100), min(base_dpi, 85)) if d <= base_dpi},
+                reverse=True,
+            )
             best_fit: tuple[Path, dict, int, int] | None = None
-            smallest_any: tuple[Path, dict, int, int] | None = (None, stats, base_dpi, base_q)  # type: ignore
-
+            smallest_any: tuple[Path, dict, int, int] = (init_path, stats, base_dpi, base_q)
             probe_idx = 0
-            while lo <= hi:
-                mid = (lo + hi) // 2
-                d_try, q_try = candidates[mid]
+
+            def _run_probe(d_try: int, q_try: int) -> tuple[Path, dict]:
+                nonlocal probe_idx, smallest_any
                 probe_idx += 1
-                cand_path = Path(td) / f"cand_{probe_idx}.pdf"
+                cand_path = td_path / f"cand_{probe_idx}.pdf"
                 cand_stats = _compress_once(
-                    source_pdf=source_pdf,
+                    source_pdf=str(staged_source),
                     dest_pdf=str(cand_path),
                     target_dpi=d_try,
                     jpeg_quality=q_try,
                     enhance_mode=canon_mode,
                     auto_crop=auto_crop,
                 )
-                if smallest_any[0] is None or cand_stats["after_bytes"] < smallest_any[1]["after_bytes"]:
+                if cand_stats["after_bytes"] < smallest_any[1]["after_bytes"]:
                     smallest_any = (cand_path, cand_stats, d_try, q_try)
+                return cand_path, cand_stats
 
-                if cand_stats["after_bytes"] <= target_bytes:
-                    best_fit = (cand_path, cand_stats, d_try, q_try)
-                    hi = mid - 1  # Try higher quality / DPI still fitting under target
-                else:
-                    lo = mid + 1  # Need stronger compression
+            for d_cand in dpi_levels:
+                if canon_mode == "bw":
+                    c_path, c_stats = _run_probe(d_cand, base_q)
+                    if c_stats["after_bytes"] <= target_bytes:
+                        best_fit = (c_path, c_stats, d_cand, base_q)
+                        break
+                    continue
+
+                q_list = [q for q in (75, 62, 50, 40, 35) if not (d_cand == base_dpi and q >= base_q)]
+                if not q_list:
+                    continue
+
+                # Check lowest quality at this DPI first so non-monotonic DPI/Q grids never skip valid higher DPIs
+                q_min = q_list[-1]
+                low_path, low_stats = _run_probe(d_cand, q_min)
+                if low_stats["after_bytes"] <= target_bytes:
+                    best_fit = (low_path, low_stats, d_cand, q_min)
+                    for q_try in q_list[:-1]:
+                        hi_path, hi_stats = _run_probe(d_cand, q_try)
+                        if hi_stats["after_bytes"] <= target_bytes:
+                            best_fit = (hi_path, hi_stats, d_cand, q_try)
+                            break
+                    break
 
             chosen = best_fit if best_fit is not None else smallest_any
-            if chosen[0] is not None and chosen[1]["after_bytes"] < stats["after_bytes"]:
-                os.replace(str(chosen[0]), os.path.abspath(output_pdf))
-                stats = chosen[1]
-                used_dpi = chosen[2]
-                used_q = chosen[3]
+            if chosen[1]["after_bytes"] < stats["after_bytes"] or (
+                best_fit is not None and chosen[1]["after_bytes"] <= target_bytes < stats["after_bytes"]
+            ):
+                chosen_path, stats, used_dpi, used_q = chosen
 
-    # Guard: if original source PDF is already smaller and user didn't request enhancement/crop, keep smallest unless target not affected
+        # Guard: if original source PDF is already smaller or equal under non-forced compress, keep original
+        kept_original = False
+        if canon_mode == "original" and not auto_crop and stats["after_bytes"] >= before_bytes:
+            kept_original = True
+            stats = {
+                **stats,
+                "recompressed_images": 0,
+                "after_bytes": before_bytes,
+            }
+            if not same_in_out:
+                _atomic_copy_file(staged_source, output_pdf)
+        else:
+            _atomic_copy_file(chosen_path, output_pdf)
+
     after_bytes = os.path.getsize(output_pdf)
     target_achieved = True if target_bytes == 0 else (after_bytes <= target_bytes)
 
     msg_parts = []
-    if stats["vector_pages"] > 0 and stats["image_pages"] == 0:
+    if kept_original:
+        msg_parts.append("Giữ nguyên PDF gốc (dung lượng đã tối ưu hơn hoặc bằng bản nén).")
+    elif stats["vector_pages"] > 0 and stats["image_pages"] == 0:
         msg_parts.append(f"Giữ nguyên {stats['vector_pages']} trang vector/text.")
     elif stats["vector_pages"] > 0:
         msg_parts.append(
@@ -364,7 +557,7 @@ def compress_pdf(
         msg_parts.append(f"Đã nén {stats['recompressed_images']} ảnh nhúng trên {stats['image_pages']} trang (giữ nguyên khổ trang gốc).")
 
     if not target_achieved:
-        target_str = f"{target_mb:.1f} MB"
+        target_str = f"{target_mb:.2f} MiB" if target_mb >= 0.01 else f"{target_mb:.4f} MiB"
         after_mb = after_bytes / (1024.0 * 1024.0)
         msg_parts.append(
             f"Không thể nén nhỏ hơn {target_str} mà vẫn giữ nguyên trang vector và độ đọc tối thiểu (đạt {after_mb:.2f} MiB ở {used_dpi} DPI, Q={used_q})."
@@ -403,19 +596,48 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _write_json_report(report_path: str | None, payload: dict) -> None:
+    if not report_path:
+        return
+    data = json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
+    batch_scanner._atomic_write_bytes(report_path, lambda fp: fp.write(data))
+
+
 if __name__ == "__main__":
     args = _build_parser().parse_args()
-    res = compress_pdf(
-        source_pdf=args.source_pdf,
-        output_pdf=args.output_pdf,
-        dpi=args.dpi,
-        jpeg_quality=args.jpeg_quality,
-        target_mb=args.target_mb,
-        mode=args.mode,
-        auto_crop=args.auto_crop,
-    )
-    if args.json_report:
-        rp = Path(args.json_report)
-        rp.parent.mkdir(parents=True, exist_ok=True)
-        rp.write_text(json.dumps(res, indent=2), encoding="utf-8")
-    print(json.dumps(res), flush=True)
+    try:
+        res = compress_pdf(
+            source_pdf=args.source_pdf,
+            output_pdf=args.output_pdf,
+            dpi=args.dpi,
+            jpeg_quality=args.jpeg_quality,
+            target_mb=args.target_mb,
+            mode=args.mode,
+            auto_crop=args.auto_crop,
+        )
+    except Exception as exc:
+        err_msg = str(exc) or exc.__class__.__name__
+        err_payload = {
+            "status": "error",
+            "error": exc.__class__.__name__,
+            "message": err_msg,
+            "before_bytes": 0,
+            "after_bytes": 0,
+            "pages": 0,
+            "vector_pages": 0,
+            "image_pages": 0,
+            "recompressed_images": 0,
+            "target_bytes": int(args.target_mb * 1024 * 1024) if args.target_mb > 0 else 0,
+            "target_achieved": False,
+            "used_dpi": max(72, int(args.dpi)),
+            "used_quality": max(35, min(95, int(args.jpeg_quality))),
+        }
+        try:
+            _write_json_report(args.json_report, err_payload)
+        except Exception:
+            pass
+        print(f"[ERROR] {err_msg}", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+    _write_json_report(args.json_report, res)
+    print(json.dumps(res, ensure_ascii=False), flush=True)

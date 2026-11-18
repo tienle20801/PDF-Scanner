@@ -1,10 +1,8 @@
 import os
 import sys
 
-import cv2
-from PIL import Image
-
 from scripts.batch_scanner import (
+    _bgr_to_pil,
     balance_page_symmetry,
     compensate_strokes_and_lines,
     convert_folder_to_hd_pdf,
@@ -14,6 +12,7 @@ from scripts.batch_scanner import (
     flatten_document_surface,
     load_image_bgr,
     multipoint_border_mask_clean,
+    normalize_enhance_mode,
 )
 
 __all__ = [
@@ -41,9 +40,7 @@ def process_image_to_scanned(image_path, enhance_mode="auto_color", auto_crop=Fa
         img = enhance_image_bgr(img, mode=enhance_mode)
         img = flatten_document_surface(img)
         img = balance_page_symmetry(img, target_shape=orig_hw)
-        if enhance_mode in ("bw", "grayscale"):
-            return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)).convert("L")
-        return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        return _bgr_to_pil(img, normalize_enhance_mode(enhance_mode))
     return enhance_image(img, mode=enhance_mode)
 
 
