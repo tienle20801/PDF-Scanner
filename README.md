@@ -1,7 +1,7 @@
 # PDF Scanner — macOS Studio & HD Document Engine 📄✨
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black.svg)](#)
 [![Zero Watermark](https://img.shields.io/badge/Watermark-None%20%2F%20Zero-brightgreen.svg)](#)
 [![Configurable DPI](https://img.shields.io/badge/Resolution-200%20DPI%20Default%20(125--300%2B)-cyan.svg)](#)
@@ -53,7 +53,7 @@ For full mathematical derivations and exact implementation parameters, see [docs
 ### 1. Prerequisites & Installation
 
 **Python CLI (`scripts/batch_scanner.py`):**
-- Python `3.9+`
+- Python `3.10+`
 - Dependencies pinned in [requirements.txt](requirements.txt) (including `pillow-heif` for `.heic`/`.heif` images)
 
 ```bash
@@ -81,10 +81,12 @@ Place your raw photos (`.jpg`, `.png`, `.webp`, `.bmp`, `.tif`/`.tiff`, `.heic`)
 ```
 
 Available CLI options (`python scripts/batch_scanner.py --help`):
+- `--output <path.pdf>` (explicit output PDF path, overrides positional `output_pdf`)
 - `--mode auto_color|clean|bw|grayscale|original` (default: `auto_color`; `magic_color` is accepted as a backward-compatible alias)
 - `--crop-engine auto|vision|opencv` (default: `auto` — uses macOS Vision `doc_scanner.swift` when available, otherwise OpenCV HSV+Otsu contour detection)
+- `--min-confidence <0.0..1.0>` (default: `0.45`, Vision crop confidence threshold)
 - `--multipoint-points <int>` (default: `32` = `128` edge control points; `0` to disable)
-- `--page-size a4|letter|fit` (default: `a4`), `--dpi <int>` (default: `200`, downscales large pages only; does not upscale), `--margin <pts>` (default: `20.0`), `--jpeg-quality <1..100>` (default: `86`)
+- `--page-size a4|letter|fit` (default: `a4`), `--dpi <int>` (default: `200`, downscales large pages only; `>= 72`), `--margin <pts>` (default: `20.0`), `--jpeg-quality <1..100>` (default: `86`)
 - `--workers <int>` (default: `1`, page-level streaming; set `>1` for multiprocessing), `--no-crop`, `--no-flatten`, `--symmetry` / `--no-symmetry` (symmetry off by default), `--worker-stdio`, `--emit-dir <dir>`, `--manifest <file.json>`, `--save-debug <dir>`
 
 Independent vector-preserving PDF compression CLI ([scripts/pdf_compressor.py](scripts/pdf_compressor.py)):
@@ -95,7 +97,7 @@ This keeps pure vector/text pages and original page `MediaBox` sizes untouched w
 
 Color and `grayscale` pages are JPEG-encoded once at the end (`quality=86` default in Python CLI, `88` in `doc_scanner.swift`) and embedded as `/DCTDecode` (`/DeviceRGB` or `/DeviceGray`); `bw` pages in Python CLI are stored as 1-bit PNGs and embedded as 1-bit `/FlateDecode` (`/DeviceGray`) inside exact `A4`, `Letter`, or `Fit` `MediaBox` PDFs.
 
-*Streaming & Worker execution:* `convert_folder_to_hd_pdf` processes pages in streaming mode (`workers=1`) or isolated per-page subprocesses (`--workers N`), keeping isolated 20-page 12MP CLI peak RSS around `433.6 MiB`. Live UI previews reuse a single warm `--worker-stdio` Python process to avoid repeated OpenCV import latency.
+*Streaming & Worker execution:* `convert_folder_to_hd_pdf` processes pages in streaming mode (`workers=1`) or isolated per-page subprocesses (`--workers N`), keeping isolated 10-page 12MP CLI Peak RSS around `1022.8 MiB` (`0.55 s/page`). Live UI previews reuse a single warm `--worker-stdio` Python process to avoid repeated OpenCV import latency.
 
 ### 3. macOS Native Desktop App (`PDF Scanner.app`)
 
@@ -108,10 +110,10 @@ open "PDF Scanner.app"
 ```
 
 Key UI capabilities:
-- **Drop-First Contextual Studio:** Adapts to `Scan`, `Ghép 2 mặt` (Pair Front + Back), `Tách PDF` (Split), `Gộp / Xoay` (Merge & Rotate), and `Nén nhẹ` (vector-preserving PDF compression with target-size loop `≤ 10 MB / 5 MB / 2 MB` and `Original` mode default).
-- **Auto Reading Orientation & Optional Invisible OCR (`vi-VT` + `en-US`):** Sorts multi-file drops naturally (`1, 2, 3... 10`), detects text reading orientation (`0° / 90° / 180° / 270°`), and optionally embeds a searchable/selectable invisible CoreText PDF text layer (`enableOCR`, off by default for maximum speed) sharing OCR observations when geometry matches.
+- **Drop-First Contextual Studio & Finder Open With:** Supports drag-and-drop, Dock icon drops, and Finder **Open With**, adapting cleanly across `Scan`, `Ghép 2 mặt` (Pair Front + Back), `Tách PDF` (Split), `Gộp / Xoay` (Merge & Rotate), and `Nén nhẹ` (vector-preserving PDF compression with target-size loop `≤ 10 MB / 5 MB / 2 MB` and `Original` mode default).
+- **Auto Reading Orientation & Optional Invisible OCR (`vi-VT` + `en-US`):** Sorts multi-file drops naturally (`1, 2, 3... 10`), detects text reading orientation via single-pass `.accurate` baseline corner voting (`0° / 90° / 180° / 270°`), and optionally embeds a searchable/selectable invisible CoreText PDF text layer (`enableOCR`, off by default for maximum speed) sharing OCR observations when upright.
 - **Interactive Before ↔ After Split Slider & Startup Preflight:** Drag the split curtain directly across `Original` ↔ `Scanned` with Pinch-to-Zoom and slider zoom (`50%`–`400%`), inspect PDFs with `PDFKit`, and run an automatic Python/OpenCV + Vision preflight check on startup with one-click fallback to `Pure Swift Vision`.
-- **Honest Engine Modes & Batch Naming Rules:** Switch between `Hybrid OpenCV + Vision` and `Pure Swift Vision` (`Clean`, `Grayscale`, `B&W`, `Original` natively in CoreImage/Vision, hiding Hybrid-only geometry options when `Pure Swift Vision` is active), reuse cached pages on export, and apply pattern naming (`TaiLieu_xx`, `Ngay_xx.11`).
+- **Honest Engine Modes & Batch Naming Rules:** Switch between `Hybrid OpenCV + Vision` and `Pure Swift Vision` (`Clean`, `Grayscale`, `B&W`, `Original` natively in CoreImage/Vision, hiding Hybrid-only geometry options when `Pure Swift Vision` is active), reuse cached pages on export, and apply safe pattern naming (`TaiLieu_xx`, `Ngay_xx.11`).
 
 ---
 
@@ -119,15 +121,14 @@ Key UI capabilities:
 
 Measured reproducibly with [scripts/benchmark.py](scripts/benchmark.py) on synthetic 12MP (`4032×3024`) documents:
 
-- **Hardware & Software:** Apple M1 (`arm64`, 8 cores, 8 GB RAM), `macOS 27.2` (`Darwin 27.2.0`), Python `3.10.22`, OpenCV `5.0.0`, NumPy `2.2.6`
-- **Command:** `.venv/bin/python scripts/benchmark.py --pages 20 --runs 5 --dpi 200`
+- **Hardware & Software:** Apple M1 (`arm64`, 8 cores, 8 GB RAM), `Darwin 27.2.0`, Python `3.10.22`, OpenCV `5.0.0`, NumPy `2.2.6`
+- **Command:** `.venv/bin/python scripts/benchmark.py --pages 10 --runs 3`
 
 | Benchmark Workload | Measured Result | Notes |
 |---|---:|---|
-| **Single 12MP Page — 6-Stage Pipeline (`A4 @ 200 DPI`, OpenCV)** | **336.4 ms** (median) | `detect_and_crop` 11.2 ms, `downscale` 15.7 ms, `multipoint` 67.2 ms, `enhance` 79.7 ms, `flatten` 85.7 ms (quality-gated), `symmetry` 76.8 ms |
-| **Single 12MP Page — `enhance_image_bgr` on full 12MP** | **377.4 ms** (median) | Includes global paper WB + downsampled (`<= 720 px`) background estimation |
-| **20-Page 12MP Batch (`workers=1`, `A4 @ 200 DPI`, OpenCV)** | **6.13 s** (0.31 s/page) | Output PDF: `2.78 MiB` • Standalone CLI (`/usr/bin/time -l`): `6.49 s`, `433.6 MiB` RSS |
-| **20-Page 12MP Batch (`workers=4`, `A4 @ 200 DPI`, OpenCV)** | **4.48 s** (0.22 s/page) | Output PDF: `2.78 MiB` • Parallel multi-process speedup |
+| **Single 12MP Page — 6-Stage Pipeline (`A4 @ 200 DPI`, OpenCV)** | **533.6 ms** (median) | `detect_and_crop` 16.7 ms, `downscale` 20.9 ms, `multipoint` 106.0 ms, `enhance` 119.2 ms, `flatten` 149.8 ms, `symmetry` 121.1 ms |
+| **Single 12MP Page — `enhance_image_bgr` on full 12MP** | **576.0 ms** (median) | Includes global paper WB + downsampled (`<= 720 px`) background estimation |
+| **10-Page 12MP Batch (`workers=1`, `A4 @ 200 DPI`, OpenCV)** | **5.50 s** (0.55 s/page) | Output PDF: `1.39 MiB` (`1,459,026 B`) • Peak RSS: `1022.8 MiB` |
 
 ---
 
@@ -172,7 +173,7 @@ Measured reproducibly with [scripts/benchmark.py](scripts/benchmark.py) on synth
 ## 🧪 Running Tests
 
 ```bash
-# Run full Python (unittest) & Swift (PDFToolsService, ScannerBridge, OCR, B5, A1/A2) suite
+# Run full 22-case Python (unittest) & Swift (PDFToolsService, ScannerBridge, OCR, B5, A1/A2, P0/P1/P2) suite
 ./tests/run_all.sh
 ```
 

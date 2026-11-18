@@ -94,6 +94,18 @@ struct ContentView: View {
             guard !vm.isBusy else { return false }
             return handleDrop(providers: providers)
         }
+        .onAppear {
+            let pending = ExternalOpenURLRouter.drain()
+            if !pending.isEmpty && !vm.isBusy {
+                vm.handleDroppedURLs(pending)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .pdfScannerOpenURLs)) { _ in
+            let incoming = ExternalOpenURLRouter.drain()
+            if !incoming.isEmpty && !vm.isBusy {
+                vm.handleDroppedURLs(incoming)
+            }
+        }
         .alert(
             "File PDF đã tồn tại",
             isPresented: Binding(

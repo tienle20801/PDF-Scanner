@@ -221,9 +221,9 @@ struct CenterCanvasView: View {
                         }
                         .frame(height: 110)
                         .background(Color(nsColor: .windowBackgroundColor))
-                        .onChange(of: vm.logs.count) { _, newCount in
-                            if newCount > 0 {
-                                proxy.scrollTo(newCount - 1, anchor: .bottom)
+                        .onChange(of: vm.logs) { _, newLogs in
+                            if !newLogs.isEmpty {
+                                proxy.scrollTo(newLogs.count - 1, anchor: .bottom)
                             }
                         }
                     }
@@ -552,50 +552,6 @@ struct InteractiveSplitComparisonView: View {
             .padding(.bottom, 8)
         }
         .padding(.top, 8)
-    }
-}
-
-struct ToggleSingleComparisonView: View {
-    let originalImage: NSImage?
-    let processedImage: NSImage?
-    let modeTitle: String
-    let isBusy: Bool
-    let fitToViewport: Bool
-    let zoomScale: CGFloat
-    @Binding var showProcessed: Bool
-    let onRenderPreview: () -> Void
-
-    var body: some View {
-        VStack(spacing: 8) {
-            let activeImg = showProcessed ? processedImage : originalImage
-            ImageStagePane(
-                title: showProcessed ? "SAU SCAN • \(modeTitle)" : "TRƯỚC • Ảnh gốc",
-                image: activeImg,
-                placeholder: showProcessed
-                    ? (isBusy ? "Đang tạo bản xem thử..." : "Chưa có bản xem thử Sau Scan")
-                    : "Chọn một trang để xem",
-                fitToViewport: fitToViewport,
-                zoomScale: zoomScale,
-                actionTitle: showProcessed && !isBusy ? "Tạo xem thử ngay" : nil,
-                action: onRenderPreview
-            )
-            .padding(.horizontal, 12)
-            .padding(.top, 8)
-
-            Button {
-                showProcessed.toggle()
-            } label: {
-                Label(
-                    showProcessed ? "Đang xem: SAU SCAN (Bấm để xem Ảnh gốc)" : "Đang xem: ẢNH GỐC (Bấm để xem Sau Scan)",
-                    systemImage: showProcessed ? "sparkles" : "photo"
-                )
-                .font(.caption.weight(.semibold))
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(showProcessed ? .accentColor : .orange)
-            .controlSize(.small)
-            .padding(.bottom, 8)
-        }
     }
 }
 

@@ -654,18 +654,25 @@ final class ScannerBridge: @unchecked Sendable {
     }
 
     static var previewCacheDirectory: URL {
-        FileManager.default.temporaryDirectory.appendingPathComponent("pdfscanner_app_previews")
+        FileManager.default.temporaryDirectory.appendingPathComponent("pdfscanner_app_previews_\(ProcessInfo.processInfo.processIdentifier)")
     }
 
     static func cleanupTemporaryCaches() {
         let fm = FileManager.default
         let tmp = fm.temporaryDirectory
         try? fm.removeItem(at: previewCacheDirectory)
-        if let entries = try? fm.contentsOfDirectory(at: tmp, includingPropertiesForKeys: nil) {
+        let staleCutoff = Date().addingTimeInterval(-86_400)
+        if let entries = try? fm.contentsOfDirectory(at: tmp, includingPropertiesForKeys: [.contentModificationDateKey]) {
             for url in entries {
                 let name = url.lastPathComponent
-                if name.hasPrefix("pdfscanner_preview_") || name.hasPrefix("pdfscanner_batch_") {
-                    try? fm.removeItem(at: url)
+                if name.hasPrefix("pdfscanner_preview_") || name.hasPrefix("pdfscanner_batch_") || name.hasPrefix("pdfscanner_app_previews_") {
+                    if name == previewCacheDirectory.lastPathComponent {
+                        continue
+                    }
+                    let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
+                    if mtime < staleCutoff {
+                        try? fm.removeItem(at: url)
+                    }
                 }
             }
         }

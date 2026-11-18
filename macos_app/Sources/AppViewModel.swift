@@ -31,7 +31,6 @@ final class AppViewModel: ObservableObject {
 
     @Published var previewDisplayMode: PreviewDisplayMode = .splitSlider
     @Published var splitSliderPosition: Double = 0.50
-    @Published var showProcessedInToggle: Bool = true
     @Published var zoomScale: CGFloat = 1.0
     @Published var fitToViewport: Bool = true
 
@@ -415,6 +414,8 @@ final class AppViewModel: ObservableObject {
             if pdfs.count == 1 && expanded.count == 1, let singlePDF = pdfs.first {
                 setRotateSource(singlePDF)
             } else if !expanded.isEmpty {
+                rotateSourceURL = nil
+                rotateSourcePageCount = 0
                 addURLs(urls)
             } else {
                 statusText = "Không tìm thấy PDF hoặc ảnh hợp lệ"
@@ -801,9 +802,15 @@ final class AppViewModel: ObservableObject {
         guard !isBusy, !queue.isEmpty else { return }
         stopAutoScanTask()
 
-        let currentOutURL = URL(fileURLWithPath: outputPDFPath.trimmingCharacters(in: .whitespacesAndNewlines))
-        let initialDir = outputPDFPath.isEmpty ? defaultOutputDir : currentOutURL.deletingLastPathComponent()
-        let suggestedName = suggestedScanOutputFilename()
+        let trimmedOut = outputPDFPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentOutURL = URL(fileURLWithPath: trimmedOut)
+        let hasPDFName = !trimmedOut.isEmpty && currentOutURL.pathExtension.lowercased() == "pdf"
+        let initialDir: URL? = trimmedOut.isEmpty
+            ? defaultOutputDir
+            : (hasPDFName ? currentOutURL.deletingLastPathComponent() : currentOutURL)
+        let suggestedName = (hasPDFName && !currentOutURL.lastPathComponent.isEmpty && currentOutURL.lastPathComponent != "Scanned_Document_HD.pdf")
+            ? currentOutURL.lastPathComponent
+            : suggestedScanOutputFilename()
 
         if let chosenURL = PDFDialogHelpers.pickSavePDF(
             defaultName: suggestedName,

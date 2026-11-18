@@ -161,41 +161,40 @@ Under Land's Retinex / Lambertian model $I(x, y) = R(x, y) \cdot L(x, y)$:
 
 ## 4. Measured Benchmarks (Apple Silicon)
 
-All timings below are reproducibly measured using [scripts/benchmark.py](../scripts/benchmark.py) on synthetic 12MP (`4032×3024` RGB) document captures:
+All timings below are reproducibly measured using [scripts/benchmark.py](../scripts/benchmark.py) (`--pages 10 --runs 3`) on synthetic 12MP (`4032×3024` RGB) document captures:
 
-- **Machine & OS:** Apple M1 (`arm64`, 8 cores, 8 GB RAM), `macOS 27.2` (`Darwin 27.2.0`)
+- **Machine & OS:** Apple Silicon (`arm64`), `Darwin 27.2.0`
 - **Runtime:** Python `3.10.22`, OpenCV `5.0.0`, NumPy `2.2.6`
 
-### 4.1 Per-Stage Latency (12MP Single Page, Median of 5 Runs)
+### 4.1 Per-Stage Latency (12MP Single Page, Median of 3 Runs)
 
 | Pipeline Stage | Working Resolution | Median Latency (ms) |
 |---|---|---:|
-| `detect_and_crop` (OpenCV) | `4032×3024` (det. at `1000 px`) | `11.2 ms` |
-| `downscale_to_dpi` (`A4 @ 200 DPI`) | `4032×3024` → `~2200×1650` | `15.7 ms` |
-| `multipoint_border_mask_clean` (`32` pts/edge) | Scaled `A4 @ 200 DPI` | `67.2 ms` |
-| `enhance_image_bgr` (`auto_color`) | Scaled `A4 @ 200 DPI` | `79.7 ms` |
-| `flatten_document_surface` (quality-gated) | Scaled `A4 @ 200 DPI` | `85.7 ms` |
-| `balance_page_symmetry` | Scaled `A4 @ 200 DPI` | `76.8 ms` |
-| **Total 6-Stage Pipeline (`A4 @ 200 DPI`)** | **12MP → A4@200** | **`336.4 ms`** |
-| *Reference: `enhance_image_bgr` on unscaled 12MP* | *`4032×3024` (e.g. `--page-size fit`)* | *`377.4 ms`* |
+| `detect_and_crop` (OpenCV) | `4032×3024` (det. at `1000 px`) | `16.7 ms` |
+| `downscale_to_dpi` (`A4 @ 200 DPI`) | `4032×3024` → `~2200×1650` | `20.9 ms` |
+| `multipoint_border_mask_clean` (`32` pts/edge) | Scaled `A4 @ 200 DPI` | `106.0 ms` |
+| `enhance_image_bgr` (`auto_color`) | Scaled `A4 @ 200 DPI` | `119.2 ms` |
+| `flatten_document_surface` (quality-gated) | Scaled `A4 @ 200 DPI` | `149.8 ms` |
+| `balance_page_symmetry` | Scaled `A4 @ 200 DPI` | `121.1 ms` |
+| **Total 6-Stage Pipeline (`A4 @ 200 DPI`)** | **12MP → A4@200** | **`533.6 ms`** |
+| *Reference: `enhance_image_bgr` on unscaled 12MP* | *`4032×3024` (e.g. `--page-size fit`)* | *`576.0 ms`* |
 
-### 4.2 End-to-End Streaming & Parallel Batch Runs (`A4 @ 200 DPI`, OpenCV)
+### 4.2 End-to-End Streaming Batch Run (`A4 @ 200 DPI`, OpenCV)
 
 | Batch Workload | Elapsed | Output PDF | Peak RSS |
 |---|---:|---:|---:|
-| **20-Page 12MP (`--workers 1`, `benchmark.py`)** | `6.13 s` (`0.31 s/page`) | `2.78 MiB` | — |
-| **20-Page 12MP Standalone CLI (`workers=1`, `/usr/bin/time -l`)** | `6.49 s` (`0.32 s/page`) | `2.78 MiB` | `433.6 MiB` |
-| **20-Page 12MP (`--workers 4`, `benchmark.py`)** | `4.48 s` (`0.22 s/page`) | `2.78 MiB` | — |
+| **10-Page 12MP (`--workers 1`, `benchmark.py`)** | `5.50 s` (`0.55 s/page`) | `1.39 MiB` (`1,459,026 B`) | `1022.8 MiB` |
 
 ---
 
 ## 5. Architecture & Remaining Research Directions
 
-### 5.1 Production Architecture Implemented in Phase 4
-- **Vector-Preserving PDF Compression ([scripts/pdf_compressor.py](../scripts/pdf_compressor.py), `B5`):** Classifies pages via `/Font` and `/Image` pixel footprint (`< 300k px`); preserves pure text/vector pages and page `MediaBox` dimensions untouched; mutates compressed `/Image` XObjects in place inside `PdfWriter` (avoiding orphaned duplicate streams) and runs binary-search over `(dpi, jpeg_quality)` down to readable floors (`85 DPI, Q=35`) for target size budgets.
-- **Self-Contained Packaging & Preflight (`A1`, `A2`):** `macos_app/build_app.sh` precompiles `scripts/doc_scanner.swift` into `Contents/Resources/bin/doc_scanner` (`swiftc -O`) and bundles relocatable `python_runtime` + `.venv` packages cleanly under strict ad-hoc `codesign`; `ScannerBridge` runs startup dependency preflight and maintains a persistent `--worker-stdio` Python process for low-latency live previews.
+### 5.1 Production Architecture Implemented (`v1.1.1`)
+- **Vector-Preserving PDF Compression ([scripts/pdf_compressor.py](../scripts/pdf_compressor.py), `B5` + `P1-20`):** Classifies pages via `/Font` and cumulative `/Image` pixel footprint (`>= 300k px`); accounts for `/Rotate`, `CTM` draw boxes, `/UserUnit`, and post-`detect_and_crop` aspect ratios when computing `eff_dpi`; stages an immutable source copy during compression (`source_pdf == output_pdf` safe); preserves pure text/vector pages and page `MediaBox` untouched; emits 1-bit `/FlateDecode` `/DeviceGray` for `mode="bw"` with size-bloat guard; and emits structured `--json-report` errors on encrypted/corrupt PDFs.
+- **Self-Contained Packaging, Preflight & Bridge (`A1`, `A2`, `P0-2`, `P1-13..18`):** `macos_app/build_app.sh` precompiles `scripts/doc_scanner.swift` into `Contents/Resources/bin/doc_scanner` (`swiftc -O`) and bundles relocatable `python_runtime` + `.venv` packages cleanly under strict ad-hoc `codesign`; `ScannerBridge` runs dependency preflight with concurrent pipe draining, discovers `python3.*` dynamically, maintains a `workerLock`-guarded `--worker-stdio` process (`NSLock` `defer` unlock safety, cancellation checks), decodes UTF-8 log streams across chunk boundaries (`LinePipeAccumulator`), rejects `nil` preview cache keys, isolates per-PID temp caches, and normalizes Unicode NFC manifest paths consistently with `batch_scanner.py` (`_canonical_path`) and `doc_scanner.swift`.
 - **Optional Vision OCR (`Q9`) & Single-Pass Corner-Vector Reading Orientation (`Q10`):** `PDFToolsService.detectReadingOrientationDegrees` builds downscaled `<= 1600 px` `CGImage` inputs directly (removing `tiffRepresentation` and global `NSLock` serialization), runs a single `.accurate` Vision OCR pass with supported `vi-VT` + `en-US` languages, and aggregates `conf^2 × alnumCount`-weighted quadrant votes from each observation's corner vector (`topRight - topLeft`, pixel-scaled with a positive `cross(u, v)` orthogonality check and dominance + margin gates over `0°`), eliminating `.fast` Vietnamese blind spots and `.accurate` internal auto-rotation ambiguity. Already-upright pages (`deg == 0`) populate the `OCRTextLine` cache reused during `compileProcessedImagesToPDF` (invisible CoreText text mode `.invisible`) when OCR is toggled on.
 - **Honest Pure Swift Engine (`Q8`):** Adds native CoreImage/DeviceGray `.grayscale` mode to `doc_scanner.swift` and surfaces actual CoreImage mode labels in UI while hiding Hybrid-only pipeline controls.
+- **Core Reliability, Security & SwiftUI Concurrency (`P0-1`, `P1-4..17`):** `batch_scanner.py` scales 16-bit grayscale (`I;16`/`I`) cleanly, composites `PA` / `*+tRNS` alpha over white, and writes manifests/PDFs atomically (`_atomic_write_bytes` via `NamedTemporaryFile`). `PDFToolsService` rejects password-protected `isLocked` PDFs, sanitizes `formatPairFileName` against path traversal and Vietnamese `\p{L}` word corruption, follows symlinks consistently on staging/cache hashing, and composites RGBA PNGs over white; `AppViewModel` uses UUID snapshots, epoch/generation guards, cancellation discrimination (`CancellationError` vs real failures), and Finder `Open With` (`ExternalOpenURLRouter`), compiling cleanly with zero warnings under `-strict-concurrency=complete`.
 
 ### 5.2 Research Directions *(Not Scheduled)*
 - Lightweight semantic segmentation for zero-contrast borderless surfaces, Thin-Plate Spline (TPS) spine mesh unwarping, Navier-Stokes specular glare inpainting, and severe two-sided bleed-through compensation below `_MAGIC_LUT` threshold `215`.

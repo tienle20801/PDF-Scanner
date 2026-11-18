@@ -119,8 +119,6 @@ enum PageSizePreset: String, CaseIterable, Identifiable {
 
 enum PreviewDisplayMode: String, CaseIterable, Identifiable {
     case splitSlider = "Kéo rèm Trước ↔ Sau"
-    case toggleSingle = "Bật / Tắt 1 Khung"
-    case sideBySide = "Đặt Cạnh Nhau"
     case pdfResult = "PDF Đã Xuất"
 
     var id: String { rawValue }
