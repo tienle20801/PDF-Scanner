@@ -153,6 +153,9 @@ func parseArgs() -> Config? {
             i += 1
             guard i < args.count else { fputs("Missing value for --save-debug\n", stderr); return nil }
             config.saveDebugDir = args[i]
+        case "--":
+            config.inputs.append(contentsOf: args[(i + 1)...])
+            i = args.count
         default:
             if arg.hasPrefix("-") {
                 fputs("Unknown option: \(arg)\n", stderr)
@@ -178,12 +181,13 @@ struct InputCandidate {
 }
 
 func canonicalPath(_ url: URL) -> String {
-    url.standardizedFileURL.resolvingSymlinksInPath().path
+    url.standardizedFileURL.resolvingSymlinksInPath().path.precomposedStringWithCanonicalMapping
 }
 
 func sanitizeFileStem(_ raw: String) -> String {
+    let nfc = raw.precomposedStringWithCanonicalMapping
     let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
-    let scalars = raw.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" }
+    let scalars = nfc.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" }
     let s = String(scalars).trimmingCharacters(in: CharacterSet(charactersIn: "_"))
     return s.isEmpty ? "page" : s
 }
@@ -275,8 +279,23 @@ func applyPerspectiveCorrection(to image: CIImage, observation: VNRectangleObser
     filter.setValue(toImagePoint(observation.bottomLeft), forKey: "inputBottomLeft")
     filter.setValue(toImagePoint(observation.bottomRight), forKey: "inputBottomRight")
 
-    guard let output = filter.outputImage else { return nil }
+    guard let output = filter.outputImage,
+          !output.extent.isInfinite,
+          !output.extent.isEmpty,
+          output.extent.width >= 1,
+          output.extent.height >= 1,
+          output.extent.width <= 30000,
+          output.extent.height <= 30000 else { return nil }
     return normalizeOrigin(output)
+}
+
+func flattenOverWhite(_ image: CIImage) -> CIImage {
+    let ext = image.extent
+    guard !ext.isInfinite, !ext.isEmpty, ext.width > 0, ext.height > 0 else {
+        return image
+    }
+    let whiteBG = CIImage(color: CIColor.white).cropped(to: ext)
+    return normalizeOrigin(image.composited(over: whiteBG))
 }
 
 func applyEnhancement(to image: CIImage, mode: ScanMode) -> CIImage {
@@ -387,11 +406,14 @@ func writeManifest(_ summary: SummaryOutput, to manifestPath: String?) {
     guard let manifestPath else { return }
     let expanded = (manifestPath as NSString).expandingTildeInPath
     let manifestURL = URL(fileURLWithPath: expanded)
-    try? FileManager.default.createDirectory(at: manifestURL.deletingLastPathComponent(), withIntermediateDirectories: true)
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-    if let data = try? encoder.encode(summary) {
-        try? data.write(to: manifestURL, options: .atomic)
+    do {
+        try FileManager.default.createDirectory(at: manifestURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let data = try encoder.encode(summary)
+        try data.write(to: manifestURL, options: .atomic)
+    } catch {
+        fputs("[WARN] Failed to write manifest to \(manifestURL.path): \(error.localizedDescription)\n", stderr)
     }
 }
 
@@ -545,6 +567,7 @@ func main() -> Int32 {
                 return
             }
 
+            working = flattenOverWhite(working)
             working = applyEnhancement(to: working, mode: config.mode)
 
             let pageSize = pageDimensions(option: config.pageSize, imageSize: working.extent.size, dpi: config.dpi)
@@ -623,11 +646,14 @@ func main() -> Int32 {
             }
 
             if let debugDir = debugDirURL {
-                let stem = imgURL.deletingPathExtension().lastPathComponent
-                let debugFile = debugDir.appendingPathComponent(String(format: "%02d_%@_scanned.jpg", idx + 1, stem))
-                try? jpegData.write(to: debugFile)
-                if emittedOutputPath == nil {
-                    emittedOutputPath = canonicalPath(debugFile)
+                let debugFile = debugDir.appendingPathComponent(String(format: "%02d_%@_scanned.jpg", idx + 1, safeStem))
+                do {
+                    try jpegData.write(to: debugFile, options: .atomic)
+                    if emittedOutputPath == nil {
+                        emittedOutputPath = canonicalPath(debugFile)
+                    }
+                } catch {
+                    fputs("[WARN] Failed to write debug image to \(debugFile.path): \(error.localizedDescription)\n", stderr)
                 }
             }
 

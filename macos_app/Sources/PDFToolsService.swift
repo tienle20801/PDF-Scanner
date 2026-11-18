@@ -11,6 +11,7 @@ import Vision
 enum PDFToolError: LocalizedError {
     case emptyInput(String)
     case invalidPDF(URL)
+    case lockedPDF(URL)
     case invalidBackSource(URL)
     case invalidPageRange(String)
     case writeFailed(URL)
@@ -20,6 +21,7 @@ enum PDFToolError: LocalizedError {
         switch self {
         case .emptyInput(let msg): return msg
         case .invalidPDF(let url): return "Không thể mở file PDF: \(url.lastPathComponent)"
+        case .lockedPDF(let url): return "File PDF đang bị khóa mật khẩu và không thể đọc: \(url.lastPathComponent)"
         case .invalidBackSource(let url): return "Không thể đọc trang mặt sau từ: \(url.lastPathComponent)"
         case .invalidPageRange(let spec): return "Dải trang không hợp lệ: '\(spec)'. Ví dụ hợp lệ: 1-3, 5, 7-9"
         case .writeFailed(let url): return "Không thể ghi file PDF đích: \(url.path)"
@@ -89,6 +91,24 @@ enum PDFToolsService {
         expandURLsWithFolderMeta(urls).map { $0.url }
     }
 
+    static func canonicalResolvedPath(_ url: URL) -> String {
+        url.standardizedFileURL.resolvingSymlinksInPath().path.precomposedStringWithCanonicalMapping
+    }
+
+    static func openUnlockedPDF(at url: URL) throws -> PDFDocument {
+        let resolved = url.resolvingSymlinksInPath()
+        guard let doc = PDFDocument(url: resolved) else {
+            throw PDFToolError.invalidPDF(url)
+        }
+        if doc.isLocked {
+            throw PDFToolError.lockedPDF(url)
+        }
+        guard doc.pageCount > 0 else {
+            throw PDFToolError.invalidPDF(url)
+        }
+        return doc
+    }
+
     static func expandURLsWithFolderMeta(_ urls: [URL]) -> [(url: URL, folderName: String?)] {
         let fm = FileManager.default
         var collected: [(url: URL, folderName: String?)] = []
@@ -98,15 +118,17 @@ enum PDFToolsService {
             guard fm.fileExists(atPath: url.path, isDirectory: &isDir) else { continue }
             if isDir.boolValue {
                 let folderName = url.lastPathComponent
+                let resolvedDir = url.resolvingSymlinksInPath()
                 if let entries = try? fm.contentsOfDirectory(
-                    at: url,
-                    includingPropertiesForKeys: [.isRegularFileKey],
+                    at: resolvedDir,
+                    includingPropertiesForKeys: nil,
                     options: [.skipsHiddenFiles]
                 ) {
                     let valid = entries
                         .filter { entry in
-                            let isFile = (try? entry.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) ?? false
-                            guard isFile else { return false }
+                            var entryIsDir: ObjCBool = false
+                            guard fm.fileExists(atPath: entry.path, isDirectory: &entryIsDir),
+                                  !entryIsDir.boolValue else { return false }
                             let ext = entry.pathExtension.lowercased()
                             return ext == "pdf" || supportedImageExtensions.contains(ext)
                         }
@@ -124,16 +146,28 @@ enum PDFToolsService {
     }
 
     static func loadInputItems(from urls: [URL]) -> [InputPageItem] {
+        loadInputItemsCheckingLocked(from: urls).items
+    }
+
+    static func loadInputItemsCheckingLocked(from urls: [URL]) -> (items: [InputPageItem], lockedPDFs: [URL]) {
         let resolved = expandURLsWithFolderMeta(urls)
         var items: [InputPageItem] = []
+        var lockedPDFs: [URL] = []
 
         for entry in resolved {
+            if Task.isCancelled { break }
             let url = entry.url
             let folderName = entry.folderName
             let ext = url.pathExtension.lowercased()
             if ext == "pdf" {
-                guard let doc = PDFDocument(url: url), doc.pageCount > 0 else { continue }
+                guard let doc = PDFDocument(url: url.resolvingSymlinksInPath()) else { continue }
+                if doc.isLocked {
+                    lockedPDFs.append(url)
+                    continue
+                }
+                guard doc.pageCount > 0 else { continue }
                 for idx in 0..<doc.pageCount {
+                    if Task.isCancelled { break }
                     guard let page = doc.page(at: idx) else { continue }
                     let thumb = page.thumbnail(of: NSSize(width: 160, height: 220), for: .cropBox)
                     let name = "\(url.lastPathComponent) [Trang \(idx + 1)/\(doc.pageCount)]"
@@ -162,7 +196,7 @@ enum PDFToolsService {
                 )
             }
         }
-        return items
+        return (items, lockedPDFs)
     }
 
     static func makeImageThumbnail(url: URL, maxSide: CGFloat = AppConstants.thumbnailMaxSide) -> NSImage? {
@@ -173,7 +207,8 @@ enum PDFToolsService {
     }
 
     static func makeDownscaledCGImage(url: URL, maxSide: CGFloat) -> CGImage? {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+        let resolved = url.resolvingSymlinksInPath()
+        guard let source = CGImageSourceCreateWithURL(resolved as CFURL, nil) else {
             return nil
         }
         let options: [CFString: Any] = [
@@ -187,7 +222,8 @@ enum PDFToolsService {
     static func loadDisplayImage(for item: InputPageItem, maxSide: CGFloat = AppConstants.previewMaxSide) -> NSImage? {
         let baseImage: NSImage?
         if let pageIdx = item.pageIndexInPDF {
-            guard let doc = PDFDocument(url: item.sourceURL),
+            guard let doc = PDFDocument(url: item.sourceURL.resolvingSymlinksInPath()),
+                  !doc.isLocked,
                   let page = doc.page(at: pageIdx) else { return nil }
             let box = page.bounds(for: .cropBox)
             let longest = max(box.width, box.height, 1.0)
@@ -237,13 +273,51 @@ enum PDFToolsService {
         let boundingBox: CGRect
     }
 
+    private final class LockedOCRCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var entries: [String: [OCRTextLine]] = [:]
+        private var insertionOrder: [String] = []
+        private let maxEntries = 200
+
+        func get(_ key: String) -> [OCRTextLine]? {
+            lock.lock()
+            defer { lock.unlock() }
+            return entries[key]
+        }
+
+        func set(_ lines: [OCRTextLine], forKey key: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            if entries[key] == nil {
+                insertionOrder.append(key)
+                if insertionOrder.count > maxEntries {
+                    let overflow = insertionOrder.count - maxEntries
+                    for oldKey in insertionOrder.prefix(overflow) {
+                        entries.removeValue(forKey: oldKey)
+                    }
+                    insertionOrder.removeFirst(overflow)
+                }
+            }
+            entries[key] = lines
+        }
+
+        func clear() {
+            lock.lock()
+            entries.removeAll()
+            insertionOrder.removeAll()
+            lock.unlock()
+        }
+    }
+
     private static let orientationQueue = DispatchQueue(
         label: "com.pdfscanner.app.orientation",
         qos: .userInitiated,
         attributes: .concurrent
     )
-    private static let ocrCacheLock = NSLock()
-    private static var ocrCacheByKey: [String: [OCRTextLine]] = [:]
+    private static let orientationSemaphore = DispatchSemaphore(
+        value: max(2, min(4, ProcessInfo.processInfo.activeProcessorCount))
+    )
+    private static let ocrCache = LockedOCRCache()
 
     private static let resolvedOCRLanguages: [String] = {
         let req = VNRecognizeTextRequest()
@@ -256,34 +330,26 @@ enum PDFToolsService {
         let deg = ((rotationDegrees % 360) + 360) % 360
         let mtimeMs = fileModificationTimestamp(for: url)
         let pageToken = pageIndex.map(String.init) ?? "img"
-        return "\(url.standardizedFileURL.resolvingSymlinksInPath().path)::\(pageToken)::\(mtimeMs)::\(deg)"
+        return "\(canonicalResolvedPath(url))::\(pageToken)::\(mtimeMs)::\(deg)"
     }
 
     static func cachedOCRTextLines(forKey key: String) -> [OCRTextLine]? {
-        ocrCacheLock.lock()
-        defer { ocrCacheLock.unlock() }
-        return ocrCacheByKey[key]
+        ocrCache.get(key)
     }
 
     private static func storeOCRTextLines(_ lines: [OCRTextLine], forKey key: String) {
-        ocrCacheLock.lock()
-        defer { ocrCacheLock.unlock() }
-        if ocrCacheByKey.count > 200 {
-            ocrCacheByKey.removeAll(keepingCapacity: true)
-        }
-        ocrCacheByKey[key] = lines
+        ocrCache.set(lines, forKey: key)
     }
 
     static func clearOCRCache() {
-        ocrCacheLock.lock()
-        ocrCacheByKey.removeAll()
-        ocrCacheLock.unlock()
+        ocrCache.clear()
     }
 
     private static func loadDirectCGImageForOCR(for item: InputPageItem, maxSide: CGFloat) -> CGImage? {
         let deg = ((item.rotationDegrees % 360) + 360) % 360
         if let pageIdx = item.pageIndexInPDF {
-            guard let doc = PDFDocument(url: item.sourceURL),
+            guard let doc = PDFDocument(url: item.sourceURL.resolvingSymlinksInPath()),
+                  !doc.isLocked,
                   let page = doc.page(at: pageIdx) else { return nil }
             let box = page.bounds(for: .cropBox)
             let longest = max(box.width, box.height, 1.0)
@@ -338,6 +404,8 @@ enum PDFToolsService {
     ) async -> Int {
         await withCheckedContinuation { continuation in
             orientationQueue.async {
+                orientationSemaphore.wait()
+                defer { orientationSemaphore.signal() }
                 let result = detectReadingOrientationDegrees(for: item, cacheAccurateOCR: cacheAccurateOCR)
                 continuation.resume(returning: result)
             }
@@ -453,7 +521,8 @@ enum PDFToolsService {
     }
 
     static func fileModificationTimestamp(for url: URL) -> Int64 {
-        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let resolved = url.standardizedFileURL.resolvingSymlinksInPath()
+        let attrs = try? FileManager.default.attributesOfItem(atPath: resolved.path)
         guard let date = attrs?[.modificationDate] as? Date else { return 0 }
         return Int64((date.timeIntervalSince1970 * 1000.0).rounded())
     }
@@ -463,7 +532,7 @@ enum PDFToolsService {
         let mtimeMs = fileModificationTimestamp(for: item.sourceURL)
         let pageToken = item.pageIndexInPDF.map(String.init) ?? "img"
         let raw = [
-            item.sourceURL.standardizedFileURL.resolvingSymlinksInPath().path,
+            canonicalResolvedPath(item.sourceURL),
             pageToken,
             String(mtimeMs),
             String(deg),
@@ -475,29 +544,44 @@ enum PDFToolsService {
 
     static let fastCopyImageExtensions: Set<String> = ["jpg", "jpeg", "png"]
 
+    private static func imageHasAlphaChannel(at url: URL) -> Bool {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return false }
+        if let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+           let hasAlpha = props[kCGImagePropertyHasAlpha] as? Bool {
+            return hasAlpha
+        }
+        if let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) {
+            let alpha = cg.alphaInfo
+            return alpha != .none && alpha != .noneSkipFirst && alpha != .noneSkipLast
+        }
+        return false
+    }
+
     static func stageItemToImageFile(
         item: InputPageItem,
         index: Int,
         stagingDir: URL
     ) throws -> URL {
         let deg = ((item.rotationDegrees % 360) + 360) % 360
+        let resolvedSource = item.sourceURL.resolvingSymlinksInPath()
         let ext = item.sourceURL.pathExtension.lowercased()
 
-        // Fast copy only for unrotated JPEG/PNG; convert TIFF/BMP/WebP/HEIC or rotated images cleanly
-        if item.pageIndexInPDF == nil && deg == 0 && fastCopyImageExtensions.contains(ext) {
+        // Fast copy only for unrotated opaque JPEG/PNG; composite transparent PNGs & convert TIFF/BMP/WebP/HEIC or rotated images cleanly
+        let hasAlpha = (ext == "png") && imageHasAlphaChannel(at: resolvedSource)
+        if item.pageIndexInPDF == nil && deg == 0 && fastCopyImageExtensions.contains(ext) && !hasAlpha {
             let safeStem = sanitizeStem(item.sourceURL.deletingPathExtension().lastPathComponent)
             let dest = stagingDir.appendingPathComponent(String(format: "%04d_%@.%@", index + 1, safeStem, ext))
             if FileManager.default.fileExists(atPath: dest.path) {
                 try FileManager.default.removeItem(at: dest)
             }
-            try FileManager.default.copyItem(at: item.sourceURL, to: dest)
+            try FileManager.default.copyItem(at: resolvedSource, to: dest)
             return dest
         }
 
         if let pageIdx = item.pageIndexInPDF {
             let dest = stagingDir.appendingPathComponent(String(format: "%04d_page.png", index + 1))
-            guard let doc = PDFDocument(url: item.sourceURL),
-                  let page = doc.page(at: pageIdx) else {
+            let doc = try openUnlockedPDF(at: resolvedSource)
+            guard let page = doc.page(at: pageIdx) else {
                 throw PDFToolError.invalidPDF(item.sourceURL)
             }
             let cgImg = try renderPDFPageToCGImage(page: page, dpi: AppConstants.pdfRenderDPI, extraClockwiseRotation: deg)
@@ -507,10 +591,10 @@ enum PDFToolsService {
 
         let dest = stagingDir.appendingPathComponent(String(format: "%04d_page.png", index + 1))
         let ciLoaded: CIImage
-        if let direct = CIImage(contentsOf: item.sourceURL, options: [.applyOrientationProperty: true]),
+        if let direct = CIImage(contentsOf: resolvedSource, options: [.applyOrientationProperty: true]),
            direct.extent.width > 0, direct.extent.height > 0 {
             ciLoaded = direct
-        } else if let src = CGImageSourceCreateWithURL(item.sourceURL as CFURL, nil),
+        } else if let src = CGImageSourceCreateWithURL(resolvedSource as CFURL, nil),
                   let cgFallback = CGImageSourceCreateImageAtIndex(src, 0, nil) {
             ciLoaded = CIImage(cgImage: cgFallback)
         } else {
@@ -608,8 +692,9 @@ enum PDFToolsService {
     }
 
     private static func sanitizeStem(_ raw: String) -> String {
+        let nfc = raw.precomposedStringWithCanonicalMapping
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
-        let scalars = raw.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" }
+        let scalars = nfc.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" }
         let s = String(scalars).trimmingCharacters(in: CharacterSet(charactersIn: "_"))
         return s.isEmpty ? "page" : s
     }
@@ -653,11 +738,10 @@ enum PDFToolsService {
         sourceURL: URL,
         mode: SplitMode,
         rangeSpec: String,
-        destinationURL: URL
+        destinationURL: URL,
+        autoRenameExisting: Bool = false
     ) throws -> [URL] {
-        guard let doc = PDFDocument(url: sourceURL), doc.pageCount > 0 else {
-            throw PDFToolError.invalidPDF(sourceURL)
-        }
+        let doc = try openUnlockedPDF(at: sourceURL)
 
         let fm = FileManager.default
         let stem = sourceURL.deletingPathExtension().lastPathComponent
@@ -666,24 +750,33 @@ enum PDFToolsService {
         switch mode {
         case .allPages:
             try fm.createDirectory(at: destinationURL, withIntermediateDirectories: true)
-            for idx in 0..<doc.pageCount {
-                guard let page = doc.page(at: idx)?.copy() as? PDFPage else { continue }
-                let single = PDFDocument()
-                single.insert(page, at: 0)
-                let outFile = destinationURL.appendingPathComponent(String(format: "%@_page_%02d.pdf", stem, idx + 1))
-                guard single.write(to: outFile) else {
-                    throw PDFToolError.writeFailed(outFile)
+            do {
+                for idx in 0..<doc.pageCount {
+                    if Task.isCancelled { throw CancellationError() }
+                    guard let page = doc.page(at: idx)?.copy() as? PDFPage else { continue }
+                    let single = PDFDocument()
+                    single.insert(page, at: 0)
+                    let rawOut = destinationURL.appendingPathComponent(String(format: "%@_page_%02d.pdf", stem, idx + 1))
+                    let outFile = autoRenameExisting ? uniqueURLIfExists(rawOut) : rawOut
+                    guard single.write(to: outFile) else {
+                        throw PDFToolError.writeFailed(outFile)
+                    }
+                    created.append(outFile)
                 }
-                created.append(outFile)
+            } catch is CancellationError {
+                for file in created { try? fm.removeItem(at: file) }
+                throw CancellationError()
             }
         case .customRange:
             let indices = try parsePageRanges(rangeSpec, totalPages: doc.pageCount)
             let outDoc = PDFDocument()
             for (insertAt, idx) in indices.enumerated() {
+                if Task.isCancelled { throw CancellationError() }
                 if let page = doc.page(at: idx)?.copy() as? PDFPage {
                     outDoc.insert(page, at: insertAt)
                 }
             }
+            if Task.isCancelled { throw CancellationError() }
             try fm.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             guard outDoc.write(to: destinationURL) else {
                 throw PDFToolError.writeFailed(destinationURL)
@@ -695,8 +788,8 @@ enum PDFToolsService {
 
     static func makePDFPage(from item: InputPageItem) throws -> PDFPage {
         if let idx = item.pageIndexInPDF {
-            guard let doc = PDFDocument(url: item.sourceURL),
-                  let page = doc.page(at: idx)?.copy() as? PDFPage else {
+            let doc = try openUnlockedPDF(at: item.sourceURL)
+            guard let page = doc.page(at: idx)?.copy() as? PDFPage else {
                 throw PDFToolError.invalidPDF(item.sourceURL)
             }
             let extra = ((item.rotationDegrees % 360) + 360) % 360
@@ -715,8 +808,8 @@ enum PDFToolsService {
     static func makeSingleBackPage(from url: URL) throws -> PDFPage {
         let ext = url.pathExtension.lowercased()
         if ext == "pdf" {
-            guard let doc = PDFDocument(url: url),
-                  let page = doc.page(at: 0)?.copy() as? PDFPage else {
+            let doc = try openUnlockedPDF(at: url)
+            guard let page = doc.page(at: 0)?.copy() as? PDFPage else {
                 throw PDFToolError.invalidBackSource(url)
             }
             return page
@@ -730,8 +823,20 @@ enum PDFToolsService {
 
     /// Formats a paired PDF filename from a pattern like "TaiLieu_xx" or "Ngay_xx.11" and a starting number.
     static func formatPairFileName(pattern: String, startIndex: Int, offset: Int) -> String {
-        let num = startIndex + offset
-        var clean = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
+        let num = max(1, startIndex) + max(0, offset)
+        var clean = pattern
+            .precomposedStringWithCanonicalMapping
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\\", with: "/")
+        clean = (clean as NSString).lastPathComponent
+        clean = clean
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "\0", with: "_")
+            .replacingOccurrences(of: "..", with: "")
+        while clean.hasPrefix(".") {
+            clean.removeFirst()
+        }
+        clean = clean.trimmingCharacters(in: .whitespacesAndNewlines)
         if clean.lowercased().hasSuffix(".pdf") {
             clean = String(clean.dropLast(4)).trimmingCharacters(in: .whitespacesAndNewlines)
         }
@@ -739,7 +844,7 @@ enum PDFToolsService {
             clean = "page"
         }
 
-        if let regex = try? NSRegularExpression(pattern: "(?<![a-zA-Z])([xX]+)(?![a-zA-Z])"),
+        if let regex = try? NSRegularExpression(pattern: "(?<!\\p{L})([xX]+)(?!\\p{L})"),
            let match = regex.firstMatch(in: clean, range: NSRange(clean.startIndex..<clean.endIndex, in: clean)),
            let range = Range(match.range(at: 1), in: clean) {
             let tokenLen = clean.distance(from: range.lowerBound, to: range.upperBound)
@@ -760,16 +865,16 @@ enum PDFToolsService {
         outputMode: PairOutputMode,
         destinationURL: URL,
         filePrefix: String,
-        startIndex: Int = 1
+        startIndex: Int = 1,
+        autoRenameExisting: Bool = false
     ) throws -> [URL] {
         let backTemplate = try makeSingleBackPage(from: backSourceURL)
         var frontPages: [PDFPage] = []
 
         if let frontPDFURL {
-            guard let doc = PDFDocument(url: frontPDFURL), doc.pageCount > 0 else {
-                throw PDFToolError.invalidPDF(frontPDFURL)
-            }
+            let doc = try openUnlockedPDF(at: frontPDFURL)
             for idx in 0..<doc.pageCount {
+                if Task.isCancelled { throw CancellationError() }
                 if let p = doc.page(at: idx)?.copy() as? PDFPage {
                     frontPages.append(p)
                 }
@@ -779,6 +884,7 @@ enum PDFToolsService {
                 throw PDFToolError.emptyInput("Chưa có trang mặt trước trong danh sách hoặc chưa chọn file PDF nguồn.")
             }
             for item in queueItems {
+                if Task.isCancelled { throw CancellationError() }
                 frontPages.append(try makePDFPage(from: item))
             }
         }
@@ -793,24 +899,39 @@ enum PDFToolsService {
         switch outputMode {
         case .separateFiles:
             try fm.createDirectory(at: destinationURL, withIntermediateDirectories: true)
-            for (idx, front) in frontPages.enumerated() {
-                let doc = PDFDocument()
-                doc.insert(front, at: 0)
-                if let backCopy = backTemplate.copy() as? PDFPage {
-                    doc.insert(backCopy, at: 1)
+            let resolvedDestDir = destinationURL.standardizedFileURL.resolvingSymlinksInPath().path
+            let dirPrefix = resolvedDestDir.hasSuffix("/") ? resolvedDestDir : resolvedDestDir + "/"
+            do {
+                for (idx, front) in frontPages.enumerated() {
+                    if Task.isCancelled { throw CancellationError() }
+                    let doc = PDFDocument()
+                    doc.insert(front, at: 0)
+                    if let backCopy = backTemplate.copy() as? PDFPage {
+                        doc.insert(backCopy, at: 1)
+                    }
+                    let fileName = formatPairFileName(pattern: filePrefix, startIndex: startIndex, offset: idx)
+                    let candidateFile = destinationURL.appendingPathComponent(fileName)
+                    let resolvedOut = candidateFile.standardizedFileURL.resolvingSymlinksInPath().path
+                    guard resolvedOut.hasPrefix(dirPrefix) else {
+                        throw PDFToolError.writeFailed(candidateFile)
+                    }
+                    let outFile = autoRenameExisting ? uniqueURLIfExists(candidateFile) : candidateFile
+                    guard doc.write(to: outFile) else {
+                        throw PDFToolError.writeFailed(outFile)
+                    }
+                    outputs.append(outFile)
                 }
-                let fileName = formatPairFileName(pattern: filePrefix, startIndex: startIndex, offset: idx)
-                let outFile = destinationURL.appendingPathComponent(fileName)
-                guard doc.write(to: outFile) else {
-                    throw PDFToolError.writeFailed(outFile)
-                }
-                outputs.append(outFile)
+            } catch is CancellationError {
+                for file in outputs { try? fm.removeItem(at: file) }
+                throw CancellationError()
             }
         case .singleCombined:
+            if Task.isCancelled { throw CancellationError() }
             try fm.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             let combined = PDFDocument()
             var insertIdx = 0
             for front in frontPages {
+                if Task.isCancelled { throw CancellationError() }
                 combined.insert(front, at: insertIdx)
                 insertIdx += 1
                 if let backCopy = backTemplate.copy() as? PDFPage {
@@ -818,6 +939,7 @@ enum PDFToolsService {
                     insertIdx += 1
                 }
             }
+            if Task.isCancelled { throw CancellationError() }
             guard combined.write(to: destinationURL) else {
                 throw PDFToolError.writeFailed(destinationURL)
             }
@@ -875,105 +997,116 @@ enum PDFToolsService {
         }
 
         let fm = FileManager.default
-        try fm.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-
-        var dummyBox = CGRect(x: 0, y: 0, width: 595.28, height: 841.89)
-        guard let pdfContext = CGContext(destinationURL as CFURL, mediaBox: &dummyBox, nil) else {
-            throw PDFToolError.writeFailed(destinationURL)
-        }
+        let parentDir = destinationURL.deletingLastPathComponent()
+        try fm.createDirectory(at: parentDir, withIntermediateDirectories: true)
+        let tempURL = parentDir.appendingPathComponent(".tmp_\(UUID().uuidString)_\(destinationURL.lastPathComponent)")
+        defer { try? fm.removeItem(at: tempURL) }
 
         var renderedPages = 0
-        for (idx, imgURL) in imageURLs.enumerated() {
-            let ext = imgURL.pathExtension.lowercased()
-            var cgImg: CGImage?
-
-            if (ext == "jpg" || ext == "jpeg"),
-               let provider = CGDataProvider(url: imgURL as CFURL) {
-                cgImg = CGImage(
-                    jpegDataProviderSource: provider,
-                    decode: nil,
-                    shouldInterpolate: true,
-                    intent: .defaultIntent
-                )
-            }
-            if cgImg == nil,
-               let src = CGImageSourceCreateWithURL(imgURL as CFURL, nil) {
-                cgImg = CGImageSourceCreateImageAtIndex(src, 0, nil)
-            }
-            guard let loadedCG = cgImg else {
-                throw PDFToolError.imageLoadFailed(imgURL)
+        try {
+            var dummyBox = CGRect(x: 0, y: 0, width: 595.28, height: 841.89)
+            guard let pdfContext = CGContext(tempURL as CFURL, mediaBox: &dummyBox, nil) else {
+                throw PDFToolError.writeFailed(destinationURL)
             }
 
-            let imgW = Double(loadedCG.width)
-            let imgH = Double(loadedCG.height)
-            let effectiveDPI = Double(max(72, settings.dpi))
-            let isLandscape = imgW > imgH
-            let pageSize: CGSize
-            switch settings.pageSize {
-            case .a4:
-                pageSize = isLandscape
-                    ? CGSize(width: 841.89, height: 595.28)
-                    : CGSize(width: 595.28, height: 841.89)
-            case .letter:
-                pageSize = isLandscape
-                    ? CGSize(width: 792.0, height: 612.0)
-                    : CGSize(width: 612.0, height: 792.0)
-            case .fit:
-                pageSize = CGSize(
-                    width: max(72.0, imgW * 72.0 / effectiveDPI),
-                    height: max(72.0, imgH * 72.0 / effectiveDPI)
-                )
-            }
+            for (idx, imgURL) in imageURLs.enumerated() {
+                if Task.isCancelled { throw CancellationError() }
+                let ext = imgURL.pathExtension.lowercased()
+                var cgImg: CGImage?
 
-            let effectiveMargin = (settings.pageSize == .fit) ? 0.0 : settings.margin
-            let availW = max(10.0, Double(pageSize.width) - 2.0 * effectiveMargin)
-            let availH = max(10.0, Double(pageSize.height) - 2.0 * effectiveMargin)
-            let drawScale = min(availW / max(imgW, 1.0), availH / max(imgH, 1.0))
-            let drawW = imgW * drawScale
-            let drawH = imgH * drawScale
-            let drawX = (Double(pageSize.width) - drawW) / 2.0
-            let drawY = (Double(pageSize.height) - drawH) / 2.0
-            let drawRect = CGRect(x: drawX, y: drawY, width: drawW, height: drawH)
-
-            var ocrLines: [OCRTextLine] = []
-            if settings.enableOCR {
-                // Share Q10 OCR observations when crop didn't alter page geometry; otherwise recognize processed image & cache
-                if !settings.autoCrop,
-                   let sourceItems, idx < sourceItems.count {
-                    let srcKey = ocrCacheKey(
-                        for: sourceItems[idx].sourceURL,
-                        pageIndex: sourceItems[idx].pageIndexInPDF,
-                        rotationDegrees: sourceItems[idx].rotationDegrees
+                if (ext == "jpg" || ext == "jpeg"),
+                   let provider = CGDataProvider(url: imgURL as CFURL) {
+                    cgImg = CGImage(
+                        jpegDataProviderSource: provider,
+                        decode: nil,
+                        shouldInterpolate: true,
+                        intent: .defaultIntent
                     )
-                    if let reused = cachedOCRTextLines(forKey: srcKey) {
-                        ocrLines = reused
+                }
+                if cgImg == nil,
+                   let src = CGImageSourceCreateWithURL(imgURL as CFURL, nil) {
+                    cgImg = CGImageSourceCreateImageAtIndex(src, 0, nil)
+                }
+                guard let loadedCG = cgImg else {
+                    throw PDFToolError.imageLoadFailed(imgURL)
+                }
+
+                let imgW = Double(loadedCG.width)
+                let imgH = Double(loadedCG.height)
+                let effectiveDPI = Double(max(72, settings.dpi))
+                let isLandscape = imgW > imgH
+                let pageSize: CGSize
+                switch settings.pageSize {
+                case .a4:
+                    pageSize = isLandscape
+                        ? CGSize(width: 841.89, height: 595.28)
+                        : CGSize(width: 595.28, height: 841.89)
+                case .letter:
+                    pageSize = isLandscape
+                        ? CGSize(width: 792.0, height: 612.0)
+                        : CGSize(width: 612.0, height: 792.0)
+                case .fit:
+                    pageSize = CGSize(
+                        width: max(72.0, imgW * 72.0 / effectiveDPI),
+                        height: max(72.0, imgH * 72.0 / effectiveDPI)
+                    )
+                }
+
+                let effectiveMargin = (settings.pageSize == .fit) ? 0.0 : settings.margin
+                let availW = max(10.0, Double(pageSize.width) - 2.0 * effectiveMargin)
+                let availH = max(10.0, Double(pageSize.height) - 2.0 * effectiveMargin)
+                let drawScale = min(availW / max(imgW, 1.0), availH / max(imgH, 1.0))
+                let drawW = imgW * drawScale
+                let drawH = imgH * drawScale
+                let drawX = (Double(pageSize.width) - drawW) / 2.0
+                let drawY = (Double(pageSize.height) - drawH) / 2.0
+                let drawRect = CGRect(x: drawX, y: drawY, width: drawW, height: drawH)
+
+                var ocrLines: [OCRTextLine] = []
+                if settings.enableOCR {
+                    // Share Q10 OCR observations when crop didn't alter page geometry; otherwise recognize processed image & cache
+                    if !settings.autoCrop,
+                       let sourceItems, idx < sourceItems.count {
+                        let srcKey = ocrCacheKey(
+                            for: sourceItems[idx].sourceURL,
+                            pageIndex: sourceItems[idx].pageIndexInPDF,
+                            rotationDegrees: sourceItems[idx].rotationDegrees
+                        )
+                        if let reused = cachedOCRTextLines(forKey: srcKey) {
+                            ocrLines = reused
+                        }
+                    }
+                    if ocrLines.isEmpty {
+                        let procKey = ocrCacheKey(for: imgURL)
+                        ocrLines = recognizeTextLines(in: loadedCG, recognitionLevel: .accurate, cacheKey: procKey)
                     }
                 }
-                if ocrLines.isEmpty {
-                    let procKey = ocrCacheKey(for: imgURL)
-                    ocrLines = recognizeTextLines(in: loadedCG, recognitionLevel: .accurate, cacheKey: procKey)
+
+                var mediaBox = CGRect(origin: .zero, size: pageSize)
+                let pageInfo: [CFString: Any] = [
+                    kCGPDFContextMediaBox: NSData(bytes: &mediaBox, length: MemoryLayout<CGRect>.size)
+                ]
+                pdfContext.beginPDFPage(pageInfo as CFDictionary)
+                pdfContext.setFillColor(CGColor(gray: 1.0, alpha: 1.0))
+                pdfContext.fill(mediaBox)
+                pdfContext.draw(loadedCG, in: drawRect)
+                if settings.enableOCR && !ocrLines.isEmpty {
+                    drawInvisibleOCRTextLayer(lines: ocrLines, in: pdfContext, drawRect: drawRect)
                 }
+                pdfContext.endPDFPage()
+                renderedPages += 1
             }
 
-            var mediaBox = CGRect(origin: .zero, size: pageSize)
-            let pageInfo: [CFString: Any] = [
-                kCGPDFContextMediaBox: NSData(bytes: &mediaBox, length: MemoryLayout<CGRect>.size)
-            ]
-            pdfContext.beginPDFPage(pageInfo as CFDictionary)
-            pdfContext.setFillColor(CGColor(gray: 1.0, alpha: 1.0))
-            pdfContext.fill(mediaBox)
-            pdfContext.draw(loadedCG, in: drawRect)
-            if settings.enableOCR && !ocrLines.isEmpty {
-                drawInvisibleOCRTextLayer(lines: ocrLines, in: pdfContext, drawRect: drawRect)
-            }
-            pdfContext.endPDFPage()
-            renderedPages += 1
-        }
+            pdfContext.closePDF()
+        }()
 
-        pdfContext.closePDF()
-        guard renderedPages > 0 else {
-            try? fm.removeItem(at: destinationURL)
+        guard renderedPages > 0, fm.fileExists(atPath: tempURL.path) else {
             throw PDFToolError.emptyInput("Không thể xuất trang nào vào PDF.")
+        }
+        if fm.fileExists(atPath: destinationURL.path) {
+            _ = try fm.replaceItemAt(destinationURL, withItemAt: tempURL)
+        } else {
+            try fm.moveItem(at: tempURL, to: destinationURL)
         }
     }
 
@@ -983,9 +1116,11 @@ enum PDFToolsService {
         }
         let doc = PDFDocument()
         for (idx, item) in items.enumerated() {
+            if Task.isCancelled { throw CancellationError() }
             let page = try makePDFPage(from: item)
             doc.insert(page, at: idx)
         }
+        if Task.isCancelled { throw CancellationError() }
         try FileManager.default.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         guard doc.write(to: destinationURL) else {
             throw PDFToolError.writeFailed(destinationURL)
@@ -1000,16 +1135,17 @@ enum PDFToolsService {
         let merged = PDFDocument()
         var insertAt = 0
         for url in urls {
-            guard let src = PDFDocument(url: url) else {
-                throw PDFToolError.invalidPDF(url)
-            }
+            if Task.isCancelled { throw CancellationError() }
+            let src = try openUnlockedPDF(at: url)
             for idx in 0..<src.pageCount {
+                if Task.isCancelled { throw CancellationError() }
                 if let page = src.page(at: idx)?.copy() as? PDFPage {
                     merged.insert(page, at: insertAt)
                     insertAt += 1
                 }
             }
         }
+        if Task.isCancelled { throw CancellationError() }
         try FileManager.default.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         guard merged.write(to: destinationURL) else {
             throw PDFToolError.writeFailed(destinationURL)
@@ -1024,12 +1160,11 @@ enum PDFToolsService {
         autoPortrait: Bool,
         rangeSpec: String
     ) throws -> Int {
-        guard let doc = PDFDocument(url: sourceURL), doc.pageCount > 0 else {
-            throw PDFToolError.invalidPDF(sourceURL)
-        }
+        let doc = try openUnlockedPDF(at: sourceURL)
         let targetIndices = Set(try parsePageRanges(rangeSpec, totalPages: doc.pageCount))
         var rotatedCount = 0
         for idx in 0..<doc.pageCount where targetIndices.contains(idx) {
+            if Task.isCancelled { throw CancellationError() }
             guard let page = doc.page(at: idx) else { continue }
             if autoPortrait {
                 let bounds = page.bounds(for: .cropBox)
@@ -1046,6 +1181,7 @@ enum PDFToolsService {
                 rotatedCount += 1
             }
         }
+        if Task.isCancelled { throw CancellationError() }
         try FileManager.default.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         guard doc.write(to: destinationURL) else {
             throw PDFToolError.writeFailed(destinationURL)

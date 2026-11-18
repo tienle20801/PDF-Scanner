@@ -43,6 +43,7 @@ struct TaskRailView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .disabled(vm.isBusy)
                 .padding(.horizontal, 6)
                 .help(task.fullTitle)
             }
@@ -64,6 +65,7 @@ struct TaskRailView: View {
                     .padding(.vertical, 5)
                 }
                 .buttonStyle(.borderless)
+                .disabled(vm.isBusy)
                 .help("Chọn ảnh, PDF hoặc thư mục")
 
                 Button {
@@ -79,6 +81,7 @@ struct TaskRailView: View {
                     .padding(.vertical, 5)
                 }
                 .buttonStyle(.borderless)
+                .disabled(vm.isBusy)
                 .help("Nạp file mẫu từ thư mục input/")
 
                 Button {

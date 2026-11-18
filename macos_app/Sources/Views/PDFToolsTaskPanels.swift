@@ -60,7 +60,7 @@ struct PairTaskPanel: View {
                                 Spacer()
                                 Button("Chọn PDF...") {
                                     if let url = PDFDialogHelpers.pickSingleFile(types: [.pdf], title: "Chọn PDF các trang mặt trước", root: vm.workspaceRoot) {
-                                        vm.pairFrontPDFURL = url
+                                        vm.setPairFrontPDF(url)
                                     }
                                 }
                                 .controlSize(.small)
@@ -77,7 +77,7 @@ struct PairTaskPanel: View {
                             Spacer()
                             Button("Chọn...") {
                                 if let url = PDFDialogHelpers.pickSingleFile(types: [.pdf, .image], title: "Chọn trang mặt sau (PDF hoặc ảnh)", root: vm.workspaceRoot) {
-                                    vm.pairBackSourceURL = url
+                                    vm.setPairBackSource(url)
                                 }
                             }
                             .controlSize(.small)
@@ -109,8 +109,11 @@ struct PairTaskPanel: View {
                                         .textFieldStyle(.roundedBorder)
                                         .font(.caption.monospacedDigit())
                                         .frame(width: 60)
-                                    Stepper("", value: $vm.pairStartIndex, in: 0...9999)
+                                    Stepper("", value: $vm.pairStartIndex, in: 1...9999)
                                         .labelsHidden()
+                                }
+                                .onChange(of: vm.pairStartIndex) { _, newValue in
+                                    if newValue < 1 { vm.pairStartIndex = 1 }
                                 }
 
                                 let p1 = PDFToolsService.formatPairFileName(pattern: vm.pairFilePrefix, startIndex: vm.pairStartIndex, offset: 0)
@@ -129,30 +132,42 @@ struct PairTaskPanel: View {
             Divider()
 
             VStack {
-                Button {
-                    if vm.pairOutputMode == .separateFiles {
-                        if let choice = PDFDialogHelpers.pickPairDestinationWithNamingRule(
-                            defaultDir: vm.defaultOutputDir,
-                            initialPattern: vm.pairFilePrefix,
-                            initialStartIndex: vm.pairStartIndex
-                        ) {
-                            vm.pairFilePrefix = choice.pattern
-                            vm.pairStartIndex = choice.startIndex
-                            vm.runPairFrontAndBack(destinationURL: choice.directory)
-                        }
-                    } else {
-                        if let file = PDFDialogHelpers.pickSavePDF(defaultName: "Paired_Combined.pdf", title: "Lưu file PDF ghép xen kẽ", defaultDir: vm.defaultOutputDir) {
-                            vm.runPairFrontAndBack(destinationURL: file)
-                        }
+                if vm.isBusy {
+                    Button(role: .destructive) {
+                        vm.cancelRunningTask()
+                    } label: {
+                        Label("Dừng ghép cặp", systemImage: "stop.circle.fill")
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 4)
                     }
-                } label: {
-                    Label("Ghép Cặp & Lưu PDF...", systemImage: "rectangle.on.rectangle.angled")
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 4)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                } else {
+                    Button {
+                        guard vm.validatePairInputs() else { return }
+                        if vm.pairOutputMode == .separateFiles {
+                            if let choice = PDFDialogHelpers.pickPairDestinationWithNamingRule(
+                                defaultDir: vm.defaultOutputDir,
+                                initialPattern: vm.pairFilePrefix,
+                                initialStartIndex: vm.pairStartIndex
+                            ) {
+                                vm.pairFilePrefix = choice.pattern
+                                vm.pairStartIndex = max(1, choice.startIndex)
+                                vm.runPairFrontAndBack(destinationURL: choice.directory)
+                            }
+                        } else {
+                            if let file = PDFDialogHelpers.pickSavePDF(defaultName: "Paired_Combined.pdf", title: "Lưu file PDF ghép xen kẽ", defaultDir: vm.defaultOutputDir) {
+                                vm.runPairFrontAndBack(destinationURL: file, confirmOverwrite: false)
+                            }
+                        }
+                    } label: {
+                        Label("Ghép Cặp & Lưu PDF...", systemImage: "rectangle.on.rectangle.angled")
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 4)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .disabled(vm.isBusy)
             }
             .padding(12)
             .background(.bar)
@@ -182,8 +197,7 @@ struct SplitTaskPanel: View {
                             Spacer()
                             Button("Chọn PDF...") {
                                 if let url = PDFDialogHelpers.pickSingleFile(types: [.pdf], title: "Chọn file PDF cần tách", root: vm.workspaceRoot) {
-                                    vm.splitSourceURL = url
-                                    vm.splitSourcePageCount = PDFDocument(url: url)?.pageCount ?? 0
+                                    vm.setSplitSource(url)
                                 }
                             }
                             .controlSize(.small)
@@ -220,25 +234,37 @@ struct SplitTaskPanel: View {
             Divider()
 
             VStack {
-                Button {
-                    if vm.splitMode == .allPages {
-                        if let dir = PDFDialogHelpers.pickDirectory(title: "Chọn thư mục lưu các trang đã tách", defaultDir: vm.defaultOutputDir) {
-                            vm.runSplitPDF(destinationURL: dir)
-                        }
-                    } else {
-                        let stem = vm.splitSourceURL?.deletingPathExtension().lastPathComponent ?? "extracted"
-                        if let file = PDFDialogHelpers.pickSavePDF(defaultName: "\(stem)_extract.pdf", title: "Lưu PDF đã trích xuất", defaultDir: vm.defaultOutputDir) {
-                            vm.runSplitPDF(destinationURL: file)
-                        }
+                if vm.isBusy {
+                    Button(role: .destructive) {
+                        vm.cancelRunningTask()
+                    } label: {
+                        Label("Dừng tách PDF", systemImage: "stop.circle.fill")
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 4)
                     }
-                } label: {
-                    Label("Thực Hiện Tách PDF...", systemImage: "scissors")
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 4)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                } else {
+                    Button {
+                        if vm.splitMode == .allPages {
+                            if let dir = PDFDialogHelpers.pickDirectory(title: "Chọn thư mục lưu các trang đã tách", defaultDir: vm.defaultOutputDir) {
+                                vm.runSplitPDF(destinationURL: dir)
+                            }
+                        } else {
+                            let stem = vm.splitSourceURL?.deletingPathExtension().lastPathComponent ?? "extracted"
+                            if let file = PDFDialogHelpers.pickSavePDF(defaultName: "\(stem)_extract.pdf", title: "Lưu PDF đã trích xuất", defaultDir: vm.defaultOutputDir) {
+                                vm.runSplitPDF(destinationURL: file, confirmOverwrite: false)
+                            }
+                        }
+                    } label: {
+                        Label("Thực Hiện Tách PDF...", systemImage: "scissors")
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 4)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .disabled(vm.splitSourceURL == nil)
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .disabled(vm.isBusy || vm.splitSourceURL == nil)
             }
             .padding(12)
             .background(.bar)
@@ -250,93 +276,111 @@ struct MergeRotateTaskPanel: View {
     @ObservedObject var vm: AppViewModel
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                InspectorCard(title: "1. Gộp nhanh giữ nguyên gốc") {
-                    Text("Gộp trực tiếp bằng PDFKit, giữ nguyên độ phân giải và góc xoay đã chỉnh.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    InspectorCard(title: "1. Gộp nhanh giữ nguyên gốc") {
+                        Text("Gộp trực tiếp bằng PDFKit, giữ nguyên độ phân giải và góc xoay đã chỉnh.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
 
-                    Button {
-                        if let file = PDFDialogHelpers.pickSavePDF(defaultName: "Merged_Queue.pdf", title: "Lưu file PDF đã gộp", defaultDir: vm.defaultOutputDir) {
-                            vm.runMergeQueue(destinationURL: file)
+                        Button {
+                            if let file = PDFDialogHelpers.pickSavePDF(defaultName: "Merged_Queue.pdf", title: "Lưu file PDF đã gộp", defaultDir: vm.defaultOutputDir) {
+                                vm.runMergeQueue(destinationURL: file, confirmOverwrite: false)
+                            }
+                        } label: {
+                            Label("Gộp \(vm.queue.count) trang đang mở...", systemImage: "square.stack.3d.up")
+                                .frame(maxWidth: .infinity)
                         }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .disabled(vm.isBusy || vm.queue.isEmpty)
+
+                        Button {
+                            let files = PDFDialogHelpers.pickMultiplePDFs(root: vm.workspaceRoot)
+                            if !files.isEmpty,
+                               let out = PDFDialogHelpers.pickSavePDF(defaultName: "Merged_Files.pdf", title: "Lưu file PDF gộp", defaultDir: vm.defaultOutputDir) {
+                                vm.runMergeExternalPDFs(urls: files, destinationURL: out, confirmOverwrite: false)
+                            }
+                        } label: {
+                            Label("Chọn nhiều file PDF từ Finder...", systemImage: "folder.badge.plus")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(vm.isBusy)
+                    }
+
+                    InspectorCard(title: "2. Xoay chiều file PDF") {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(vm.rotateSourceURL?.lastPathComponent ?? "Chưa chọn file PDF...")
+                                    .font(.caption2)
+                                    .lineLimit(1)
+                                if vm.rotateSourcePageCount > 0 {
+                                    Text("\(vm.rotateSourcePageCount) trang")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer()
+                            Button("Chọn PDF...") {
+                                if let url = PDFDialogHelpers.pickSingleFile(types: [.pdf], title: "Chọn PDF cần xoay", root: vm.workspaceRoot) {
+                                    vm.setRotateSource(url)
+                                }
+                            }
+                            .controlSize(.small)
+                        }
+
+                        Toggle("Tự động xoay trang ngang thành dọc", isOn: $vm.rotateAutoPortrait)
+                            .font(.caption)
+
+                        if !vm.rotateAutoPortrait {
+                            Picker("Góc xoay", selection: $vm.rotateDegrees) {
+                                Text("90° Phải").tag(90)
+                                Text("180°").tag(180)
+                                Text("270° Trái").tag(270)
+                            }
+                            .pickerStyle(.segmented)
+                        }
+
+                        TextField("Dải trang (để trống = tất cả)", text: $vm.rotateRangeSpec)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.caption)
+
+                        Button {
+                            let stem = vm.rotateSourceURL?.deletingPathExtension().lastPathComponent ?? "rotated"
+                            if let file = PDFDialogHelpers.pickSavePDF(defaultName: "\(stem)_rotated.pdf", title: "Lưu PDF đã xoay", defaultDir: vm.defaultOutputDir) {
+                                vm.runRotatePDF(destinationURL: file, confirmOverwrite: false)
+                            }
+                        } label: {
+                            Label("Xoay & Lưu PDF...", systemImage: "rotate.right")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(vm.isBusy || vm.rotateSourceURL == nil)
+                    }
+                }
+                .padding(12)
+            }
+
+            if vm.isBusy {
+                Divider()
+                VStack {
+                    Button(role: .destructive) {
+                        vm.cancelRunningTask()
                     } label: {
-                        Label("Gộp \(vm.queue.count) trang đang mở...", systemImage: "square.stack.3d.up")
+                        Label("Dừng tác vụ đang chạy", systemImage: "stop.circle.fill")
                             .frame(maxWidth: .infinity)
+                            .padding(.vertical, 4)
                     }
                     .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .disabled(vm.isBusy || vm.queue.isEmpty)
-
-                    Button {
-                        let files = PDFDialogHelpers.pickMultiplePDFs(root: vm.workspaceRoot)
-                        if !files.isEmpty,
-                           let out = PDFDialogHelpers.pickSavePDF(defaultName: "Merged_Files.pdf", title: "Lưu file PDF gộp", defaultDir: vm.defaultOutputDir) {
-                            vm.runMergeExternalPDFs(urls: files, destinationURL: out)
-                        }
-                    } label: {
-                        Label("Chọn nhiều file PDF từ Finder...", systemImage: "folder.badge.plus")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(vm.isBusy)
+                    .controlSize(.large)
                 }
-
-                InspectorCard(title: "2. Xoay chiều file PDF") {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(vm.rotateSourceURL?.lastPathComponent ?? "Chưa chọn file PDF...")
-                                .font(.caption2)
-                                .lineLimit(1)
-                            if vm.rotateSourcePageCount > 0 {
-                                Text("\(vm.rotateSourcePageCount) trang")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        Spacer()
-                        Button("Chọn PDF...") {
-                            if let url = PDFDialogHelpers.pickSingleFile(types: [.pdf], title: "Chọn PDF cần xoay", root: vm.workspaceRoot) {
-                                vm.rotateSourceURL = url
-                                vm.rotateSourcePageCount = PDFDocument(url: url)?.pageCount ?? 0
-                            }
-                        }
-                        .controlSize(.small)
-                    }
-
-                    Toggle("Tự động xoay trang ngang thành dọc", isOn: $vm.rotateAutoPortrait)
-                        .font(.caption)
-
-                    if !vm.rotateAutoPortrait {
-                        Picker("Góc xoay", selection: $vm.rotateDegrees) {
-                            Text("90° Phải").tag(90)
-                            Text("180°").tag(180)
-                            Text("270° Trái").tag(270)
-                        }
-                        .pickerStyle(.segmented)
-                    }
-
-                    TextField("Dải trang (để trống = tất cả)", text: $vm.rotateRangeSpec)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.caption)
-
-                    Button {
-                        let stem = vm.rotateSourceURL?.deletingPathExtension().lastPathComponent ?? "rotated"
-                        if let file = PDFDialogHelpers.pickSavePDF(defaultName: "\(stem)_rotated.pdf", title: "Lưu PDF đã xoay", defaultDir: vm.defaultOutputDir) {
-                            vm.runRotatePDF(destinationURL: file)
-                        }
-                    } label: {
-                        Label("Xoay & Lưu PDF...", systemImage: "rotate.right")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(vm.isBusy || vm.rotateSourceURL == nil)
-                }
+                .padding(12)
+                .background(.bar)
             }
-            .padding(12)
         }
     }
 }
@@ -363,11 +407,7 @@ struct CompressTaskPanel: View {
                             Spacer()
                             Button("Chọn PDF...") {
                                 if let url = PDFDialogHelpers.pickSingleFile(types: [.pdf], title: "Chọn PDF cần nén", root: vm.workspaceRoot) {
-                                    vm.compressSourceURL = url
-                                    let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
-                                    vm.compressSourceBytes = (attrs?[.size] as? Int64) ?? 0
-                                    vm.lastCompressionReport = ""
-                                    vm.lastCompressionWarning = ""
+                                    vm.setCompressSource(url)
                                 }
                             }
                             .controlSize(.small)
@@ -459,7 +499,7 @@ struct CompressTaskPanel: View {
                     Button {
                         let stem = vm.compressSourceURL?.deletingPathExtension().lastPathComponent ?? "compressed"
                         if let file = PDFDialogHelpers.pickSavePDF(defaultName: "\(stem)_\(vm.compressDPI)dpi.pdf", title: "Lưu PDF đã nén", defaultDir: vm.defaultOutputDir) {
-                            vm.runCompressPDF(destinationURL: file)
+                            vm.runCompressPDF(destinationURL: file, confirmOverwrite: false)
                         }
                     } label: {
                         Label("Nén & Xuất PDF...", systemImage: "arrow.down.right.and.arrow.up.left")

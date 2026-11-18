@@ -39,10 +39,13 @@ struct PairNamingAccessoryView: View {
                             .textFieldStyle(.roundedBorder)
                             .font(.caption.monospacedDigit())
                             .frame(width: 56)
-                        Stepper("", value: $model.startIndex, in: 0...9999)
+                        Stepper("", value: $model.startIndex, in: 1...9999)
                             .labelsHidden()
                     }
                 }
+            }
+            .onChange(of: model.startIndex) { _, newValue in
+                if newValue < 1 { model.startIndex = 1 }
             }
 
             let sample1 = PDFToolsService.formatPairFileName(pattern: model.pattern, startIndex: model.startIndex, offset: 0)
@@ -114,7 +117,7 @@ enum PDFDialogHelpers {
             panel.directoryURL = defaultDir
         }
 
-        let ruleModel = PairNamingRuleModel(pattern: initialPattern, startIndex: initialStartIndex)
+        let ruleModel = PairNamingRuleModel(pattern: initialPattern, startIndex: max(1, initialStartIndex))
         let hosting = NSHostingView(rootView: PairNamingAccessoryView(model: ruleModel))
         hosting.frame = NSRect(origin: .zero, size: hosting.fittingSize)
         panel.accessoryView = hosting
@@ -123,7 +126,7 @@ enum PDFDialogHelpers {
         guard panel.runModal() == .OK, let dir = panel.url else {
             return nil
         }
-        return (dir, ruleModel.pattern, ruleModel.startIndex)
+        return (dir, ruleModel.pattern, max(1, ruleModel.startIndex))
     }
 
     @MainActor

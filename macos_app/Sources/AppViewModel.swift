@@ -5,7 +5,21 @@ import SwiftUI
 struct PendingOverwriteAction: Identifiable {
     let id = UUID()
     let targetURL: URL
-    let onProceed: (URL) -> Void
+    let existingCount: Int
+    let onOverwrite: () -> Void
+    let onSaveUnique: () -> Void
+
+    init(
+        targetURL: URL,
+        existingCount: Int = 1,
+        onOverwrite: @escaping () -> Void,
+        onSaveUnique: @escaping () -> Void
+    ) {
+        self.targetURL = targetURL
+        self.existingCount = existingCount
+        self.onOverwrite = onOverwrite
+        self.onSaveUnique = onSaveUnique
+    }
 }
 
 @MainActor
@@ -75,7 +89,15 @@ final class AppViewModel: ObservableObject {
     private var bridge: ScannerBridge?
     private var autoScanTask: Task<Void, Never>?
     private var activeWorkTask: Task<Void, Never>?
+    private var activeWorkToken: UUID?
     private var activeScanTargetIDs: [UUID] = []
+    private var activePreviewItemKey: (id: UUID, cacheKey: String)?
+    private var queueEpoch: UInt64 = 0
+    private var taskEpoch: UInt64 = 0
+    private var autoScanEpoch: UInt64 = 0
+    private var refreshGeneration: UInt64 = 0
+    private var importTasks: [UUID: Task<Void, Never>] = [:]
+    private var refreshImagesTask: Task<Void, Never>?
     private var previewCacheByKey: [String: URL] = [:]
 
     init() {
@@ -162,6 +184,10 @@ final class AppViewModel: ObservableObject {
 
     func terminateWorkers() {
         stopAutoScanTask()
+        importTasks.values.forEach { $0.cancel() }
+        importTasks.removeAll()
+        refreshImagesTask?.cancel()
+        refreshImagesTask = nil
         activeWorkTask?.cancel()
         bridge?.cancelActiveProcess()
     }
@@ -198,23 +224,31 @@ final class AppViewModel: ObservableObject {
     }
 
     func refreshSelectedImages() {
+        refreshImagesTask?.cancel()
+        refreshGeneration &+= 1
+        let gen = refreshGeneration
         guard let item = selectedItem else {
             selectedOriginalImage = nil
             selectedProcessedImage = nil
+            refreshImagesTask = nil
             return
         }
         let targetID = item.id
         let itemCopy = item
-        Task.detached(priority: .userInitiated) {
-            let orig = PDFToolsService.loadDisplayImage(for: itemCopy, maxSide: AppConstants.previewMaxSide)
-            let proc = itemCopy.processedPreviewURL.flatMap {
-                PDFToolsService.makeImageThumbnail(url: $0, maxSide: AppConstants.previewMaxSide)
-            }
-            await MainActor.run {
-                guard self.selectedItem?.id == targetID else { return }
-                self.selectedOriginalImage = orig
-                self.selectedProcessedImage = proc
-            }
+        refreshImagesTask = Task { [weak self] in
+            guard let self else { return }
+            let pair = await Task.detached(priority: .userInitiated) { () -> (NSImage?, NSImage?) in
+                if Task.isCancelled { return (nil, nil) }
+                let orig = PDFToolsService.loadDisplayImage(for: itemCopy, maxSide: AppConstants.previewMaxSide)
+                if Task.isCancelled { return (nil, nil) }
+                let proc = itemCopy.processedPreviewURL.flatMap {
+                    PDFToolsService.makeImageThumbnail(url: $0, maxSide: AppConstants.previewMaxSide)
+                }
+                return (orig, proc)
+            }.value
+            guard !Task.isCancelled, self.refreshGeneration == gen, self.selectedItem?.id == targetID else { return }
+            self.selectedOriginalImage = pair.0
+            self.selectedProcessedImage = pair.1
         }
     }
 
@@ -252,16 +286,18 @@ final class AppViewModel: ObservableObject {
         guard activeTask == .scan, let item = selectedItem, item.processedPreviewURL == nil, item.scanError == nil, !isBusy else { return }
         if previewDisplayMode == .pdfResult { return }
 
+        let desiredKey = PDFToolsService.previewCacheKey(for: item, settings: settings)
         if isPreviewing {
-            if activeScanTargetIDs.first == item.id { return }
+            if activePreviewItemKey?.id == item.id && activePreviewItemKey?.cacheKey == desiredKey { return }
             var reordered = [item.id] + activeScanTargetIDs.filter { $0 != item.id }
             reordered = reordered.filter { targetID in
                 guard let found = queue.first(where: { $0.id == targetID }) else { return false }
                 return found.processedPreviewURL == nil && found.scanError == nil
             }
-            if !reordered.isEmpty {
-                runBackgroundScan(targetIDs: reordered, debounceNs: 120_000_000)
+            if reordered.isEmpty {
+                reordered = [item.id]
             }
+            runBackgroundScan(targetIDs: reordered, debounceNs: 120_000_000)
             return
         }
 
@@ -285,8 +321,70 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    private func validateUnlockedPDF(_ url: URL) -> PDFDocument? {
+        guard let doc = PDFDocument(url: url.resolvingSymlinksInPath()) else {
+            errorMessage = PDFToolError.invalidPDF(url).localizedDescription
+            return nil
+        }
+        if doc.isLocked {
+            errorMessage = PDFToolError.lockedPDF(url).localizedDescription
+            statusText = "File PDF đang bị khóa mật khẩu"
+            return nil
+        }
+        guard doc.pageCount > 0 else {
+            errorMessage = PDFToolError.invalidPDF(url).localizedDescription
+            return nil
+        }
+        return doc
+    }
+
+    func setPairFrontPDF(_ url: URL) {
+        guard !isBusy, let doc = validateUnlockedPDF(url) else { return }
+        pairFrontPDFURL = url
+        pairUseQueueAsFront = false
+        if previewDisplayMode == .pdfResult { previewDisplayMode = .splitSlider }
+        statusText = "Đã nạp Mặt trước: \(url.lastPathComponent) (\(doc.pageCount) trang)"
+        appendLog("[Pair] Đã nạp file mặt trước: \(url.path)")
+    }
+
+    func setPairBackSource(_ url: URL) {
+        guard !isBusy else { return }
+        if url.pathExtension.lowercased() == "pdf", validateUnlockedPDF(url) == nil { return }
+        pairBackSourceURL = url
+    }
+
+    func setSplitSource(_ url: URL) {
+        guard !isBusy, let doc = validateUnlockedPDF(url) else { return }
+        splitSourceURL = url
+        splitSourcePageCount = doc.pageCount
+        if previewDisplayMode == .pdfResult { previewDisplayMode = .splitSlider }
+        statusText = "Đã nạp PDF tách: \(url.lastPathComponent) (\(splitSourcePageCount) trang)"
+        appendLog("[Split] Đã nạp nguồn: \(url.path)")
+    }
+
+    func setRotateSource(_ url: URL) {
+        guard !isBusy, let doc = validateUnlockedPDF(url) else { return }
+        rotateSourceURL = url
+        rotateSourcePageCount = doc.pageCount
+        if previewDisplayMode == .pdfResult { previewDisplayMode = .splitSlider }
+        statusText = "Đã nạp PDF cần xoay: \(url.lastPathComponent) (\(rotateSourcePageCount) trang)"
+        appendLog("[Rotate] Đã nạp nguồn: \(url.path)")
+    }
+
+    func setCompressSource(_ url: URL) {
+        guard !isBusy, validateUnlockedPDF(url) != nil else { return }
+        compressSourceURL = url
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.resolvingSymlinksInPath().path)
+        compressSourceBytes = (attrs?[.size] as? Int64) ?? 0
+        lastCompressionReport = ""
+        lastCompressionWarning = ""
+        if previewDisplayMode == .pdfResult { previewDisplayMode = .splitSlider }
+        statusText = "Đã nạp PDF cần nén: \(url.lastPathComponent) (\(PDFToolsService.formatBytes(compressSourceBytes)))"
+        appendLog("[Compress] Đã nạp nguồn: \(url.path)")
+    }
+
     func handleDroppedURLs(_ urls: [URL]) {
-        guard !urls.isEmpty else { return }
+        guard !isBusy, !urls.isEmpty else { return }
         let expanded = PDFToolsService.expandURLs(urls)
         let pdfs = expanded.filter { $0.pathExtension.lowercased() == "pdf" }
 
@@ -296,14 +394,7 @@ final class AppViewModel: ObservableObject {
 
         case .pair:
             if let firstPDF = pdfs.first {
-                pairFrontPDFURL = firstPDF
-                pairUseQueueAsFront = false
-                if previewDisplayMode == .pdfResult {
-                    previewDisplayMode = .splitSlider
-                }
-                let pageCount = PDFDocument(url: firstPDF)?.pageCount ?? 0
-                statusText = "Đã nạp Mặt trước: \(firstPDF.lastPathComponent) (\(pageCount) trang)"
-                appendLog("[Pair] Đã nạp file mặt trước: \(firstPDF.path)")
+                setPairFrontPDF(firstPDF)
             } else if !expanded.isEmpty {
                 pairUseQueueAsFront = true
                 addURLs(urls)
@@ -313,13 +404,7 @@ final class AppViewModel: ObservableObject {
 
         case .split:
             if let firstPDF = pdfs.first {
-                splitSourceURL = firstPDF
-                splitSourcePageCount = PDFDocument(url: firstPDF)?.pageCount ?? 0
-                if previewDisplayMode == .pdfResult {
-                    previewDisplayMode = .splitSlider
-                }
-                statusText = "Đã nạp PDF tách: \(firstPDF.lastPathComponent) (\(splitSourcePageCount) trang)"
-                appendLog("[Split] Đã nạp nguồn: \(firstPDF.path)")
+                setSplitSource(firstPDF)
             } else if !expanded.isEmpty {
                 pendingImageRedirectURLs = urls
             } else {
@@ -328,13 +413,7 @@ final class AppViewModel: ObservableObject {
 
         case .mergeRotate:
             if pdfs.count == 1 && expanded.count == 1, let singlePDF = pdfs.first {
-                rotateSourceURL = singlePDF
-                rotateSourcePageCount = PDFDocument(url: singlePDF)?.pageCount ?? 0
-                if previewDisplayMode == .pdfResult {
-                    previewDisplayMode = .splitSlider
-                }
-                statusText = "Đã nạp PDF cần xoay: \(singlePDF.lastPathComponent) (\(rotateSourcePageCount) trang)"
-                appendLog("[Rotate] Đã nạp nguồn: \(singlePDF.path)")
+                setRotateSource(singlePDF)
             } else if !expanded.isEmpty {
                 addURLs(urls)
             } else {
@@ -343,16 +422,7 @@ final class AppViewModel: ObservableObject {
 
         case .compress:
             if let firstPDF = pdfs.first {
-                compressSourceURL = firstPDF
-                let attrs = try? FileManager.default.attributesOfItem(atPath: firstPDF.path)
-                compressSourceBytes = (attrs?[.size] as? Int64) ?? 0
-                lastCompressionReport = ""
-                lastCompressionWarning = ""
-                if previewDisplayMode == .pdfResult {
-                    previewDisplayMode = .splitSlider
-                }
-                statusText = "Đã nạp PDF cần nén: \(firstPDF.lastPathComponent) (\(PDFToolsService.formatBytes(compressSourceBytes)))"
-                appendLog("[Compress] Đã nạp nguồn: \(firstPDF.path)")
+                setCompressSource(firstPDF)
             } else if !expanded.isEmpty {
                 pendingImageRedirectURLs = urls
             } else {
@@ -364,38 +434,55 @@ final class AppViewModel: ObservableObject {
     func redirectPendingImagesToScan() {
         let urls = pendingImageRedirectURLs
         pendingImageRedirectURLs = []
-        guard !urls.isEmpty else { return }
+        guard !isBusy, !urls.isEmpty else { return }
         activeTask = .scan
         addURLs(urls)
     }
 
     func addURLs(_ urls: [URL]) {
-        guard !urls.isEmpty else { return }
+        guard !isBusy, !urls.isEmpty else { return }
         statusText = "Đang nạp & sắp xếp A→Z..."
         let currentTask = activeTask
-        Task.detached(priority: .userInitiated) {
-            let loaded = PDFToolsService.loadInputItems(from: urls)
-            await MainActor.run {
-                if loaded.isEmpty {
-                    self.statusText = "Không tìm thấy ảnh hoặc PDF hợp lệ"
-                    return
-                }
-                self.queue.append(contentsOf: loaded)
-                self.sortQueueNaturally()
-                if self.selectedItemID == nil || !self.queue.contains(where: { $0.id == self.selectedItemID }) {
-                    self.selectedItemID = self.queue.first?.id
-                }
-                if self.previewDisplayMode == .pdfResult {
-                    self.previewDisplayMode = .splitSlider
-                }
-                self.refreshSelectedImages()
-                self.appendLog("[Queue] Đã nạp \(loaded.count) trang (tổng \(self.queue.count), đã sắp xếp A→Z).")
-                self.statusText = "Đã nạp \(loaded.count) trang (tổng \(self.queue.count) trang)"
-                if currentTask == .scan {
-                    self.startAutoScanAfterImport()
-                }
+        let importEpoch = queueEpoch
+        let taskID = UUID()
+
+        let task = Task { [weak self] in
+            guard let self else { return }
+            let result = await Task.detached(priority: .userInitiated) {
+                PDFToolsService.loadInputItemsCheckingLocked(from: urls)
+            }.value
+            self.importTasks.removeValue(forKey: taskID)
+            guard !Task.isCancelled, self.queueEpoch == importEpoch, !self.isBusy else { return }
+
+            if let lockedFirst = result.lockedPDFs.first {
+                let errText = PDFToolError.lockedPDF(lockedFirst).localizedDescription
+                self.errorMessage = errText
+                self.appendLog("[WARN] \(errText)")
+            }
+
+            let loaded = result.items
+            if loaded.isEmpty {
+                self.statusText = result.lockedPDFs.isEmpty
+                    ? "Không tìm thấy ảnh hoặc PDF hợp lệ"
+                    : "PDF đang bị khóa mật khẩu"
+                return
+            }
+            self.queue.append(contentsOf: loaded)
+            self.sortQueueNaturally()
+            if self.selectedItemID == nil || !self.queue.contains(where: { $0.id == self.selectedItemID }) {
+                self.selectedItemID = self.queue.first?.id
+            }
+            if self.previewDisplayMode == .pdfResult {
+                self.previewDisplayMode = .splitSlider
+            }
+            self.refreshSelectedImages()
+            self.appendLog("[Queue] Đã nạp \(loaded.count) trang (tổng \(self.queue.count), đã sắp xếp A→Z).")
+            self.statusText = "Đã nạp \(loaded.count) trang (tổng \(self.queue.count) trang)"
+            if currentTask == .scan && self.activeTask == .scan {
+                self.startAutoScanAfterImport()
             }
         }
+        importTasks[taskID] = task
     }
 
     func loadFromDefaultInput() {
@@ -416,7 +503,12 @@ final class AppViewModel: ObservableObject {
     }
 
     func resetCurrentTaskToNewBatch() {
+        taskEpoch &+= 1
         stopAutoScanTask()
+        if activeWorkTask != nil {
+            activeWorkTask?.cancel()
+            bridge?.cancelActiveProcess()
+        }
         lastExportedPDFURL = nil
         lastExportedFolderURL = nil
         lastExportedInfo = ""
@@ -448,6 +540,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func rotateItem(id: UUID, deltaDegrees: Int) {
+        guard !isBusy else { return }
         guard let idx = queue.firstIndex(where: { $0.id == id }) else { return }
         let updatedDeg = ((queue[idx].rotationDegrees + deltaDegrees) % 360 + 360) % 360
         queue[idx].rotationDegrees = updatedDeg
@@ -471,6 +564,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func rotateAll(deltaDegrees: Int) {
+        guard !isBusy else { return }
         stopAutoScanTask()
         for idx in queue.indices {
             queue[idx].rotationDegrees = ((queue[idx].rotationDegrees + deltaDegrees) % 360 + 360) % 360
@@ -493,6 +587,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func moveItem(id: UUID, offset: Int) {
+        guard !isBusy else { return }
         guard let idx = queue.firstIndex(where: { $0.id == id }) else { return }
         let target = idx + offset
         guard target >= 0 && target < queue.count else { return }
@@ -500,6 +595,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func removeItem(id: UUID) {
+        guard !isBusy else { return }
         queue.removeAll(where: { $0.id == id })
         if selectedItemID == id {
             selectedItemID = queue.first?.id
@@ -509,6 +605,12 @@ final class AppViewModel: ObservableObject {
     }
 
     func clearQueue() {
+        queueEpoch &+= 1
+        importTasks.values.forEach { $0.cancel() }
+        importTasks.removeAll()
+        refreshGeneration &+= 1
+        refreshImagesTask?.cancel()
+        refreshImagesTask = nil
         stopAutoScanTask()
         queue.removeAll()
         previewCacheByKey.removeAll()
@@ -529,8 +631,10 @@ final class AppViewModel: ObservableObject {
     // MARK: - Non-blocking Auto-Scan, Reading Orientation & Preview
 
     func stopAutoScanTask() {
+        autoScanEpoch &+= 1
         autoScanTask?.cancel()
         autoScanTask = nil
+        activePreviewItemKey = nil
         if isPreviewing && !isBusy {
             bridge?.cancelActiveProcess()
         }
@@ -588,6 +692,8 @@ final class AppViewModel: ObservableObject {
         guard let bridge, !isBusy else { return }
         let previousTask = autoScanTask
         stopAutoScanTask()
+        let scanEpoch = autoScanEpoch
+        let myQueueEpoch = queueEpoch
         activeScanTargetIDs = targetIDs
         isPreviewing = true
 
@@ -597,17 +703,18 @@ final class AppViewModel: ObservableObject {
             if debounceNs > 0 {
                 try? await Task.sleep(nanoseconds: debounceNs)
             }
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, self.autoScanEpoch == scanEpoch, self.queueEpoch == myQueueEpoch else { return }
 
             let total = targetIDs.count
             let logSink = self.makeLogSink()
 
             for (stepIdx, targetID) in targetIDs.enumerated() {
-                if Task.isCancelled || self.isBusy { break }
+                if Task.isCancelled || self.isBusy || self.autoScanEpoch != scanEpoch || self.queueEpoch != myQueueEpoch { break }
                 guard let currentIdx = self.queue.firstIndex(where: { $0.id == targetID }) else { continue }
                 if self.queue[currentIdx].processedPreviewURL != nil { continue }
 
                 var item = self.queue[currentIdx]
+                self.activePreviewItemKey = (targetID, PDFToolsService.previewCacheKey(for: item, settings: self.settings))
                 self.statusText = total > 1
                     ? "Đang dò hướng & scan (\(stepIdx + 1)/\(total)): \(item.displayName)..."
                     : "Đang dò hướng & làm nét: \(item.displayName)..."
@@ -619,8 +726,10 @@ final class AppViewModel: ObservableObject {
                         for: itemCopy,
                         cacheAccurateOCR: shareOCR
                     )
-                    if Task.isCancelled { break }
-                    if let idxNow = self.queue.firstIndex(where: { $0.id == targetID }) {
+                    if Task.isCancelled || self.autoScanEpoch != scanEpoch || self.queueEpoch != myQueueEpoch { break }
+                    if let idxNow = self.queue.firstIndex(where: { $0.id == targetID }),
+                       !self.queue[idxNow].orientationChecked,
+                       self.queue[idxNow].rotationDegrees == itemCopy.rotationDegrees {
                         self.queue[idxNow].orientationChecked = true
                         if deltaDeg != 0 {
                             self.queue[idxNow].rotationDegrees = ((self.queue[idxNow].rotationDegrees + deltaDeg) % 360 + 360) % 360
@@ -633,13 +742,16 @@ final class AppViewModel: ObservableObject {
                             }
                         }
                         item = self.queue[idxNow]
+                    } else if let idxNow = self.queue.firstIndex(where: { $0.id == targetID }) {
+                        item = self.queue[idxNow]
                     }
                 }
 
-                if Task.isCancelled || self.isBusy { break }
+                if Task.isCancelled || self.isBusy || self.autoScanEpoch != scanEpoch || self.queueEpoch != myQueueEpoch { break }
                 let settingsSnapshot = self.settings
                 let itemSnapshot = item
                 let cacheKey = PDFToolsService.previewCacheKey(for: itemSnapshot, settings: settingsSnapshot)
+                self.activePreviewItemKey = (targetID, cacheKey)
 
                 do {
                     let previewURL = try await bridge.previewSinglePage(
@@ -647,7 +759,7 @@ final class AppViewModel: ObservableObject {
                         settings: settingsSnapshot,
                         onLog: logSink
                     )
-                    if Task.isCancelled { break }
+                    if Task.isCancelled || self.autoScanEpoch != scanEpoch || self.queueEpoch != myQueueEpoch { break }
                     self.previewCacheByKey[cacheKey] = previewURL
                     if let idxNow = self.queue.firstIndex(where: { $0.id == targetID }),
                        PDFToolsService.previewCacheKey(for: self.queue[idxNow], settings: self.settings) == cacheKey {
@@ -658,8 +770,10 @@ final class AppViewModel: ObservableObject {
                             self.refreshSelectedImages()
                         }
                     }
+                } catch is CancellationError {
+                    break
                 } catch {
-                    if Task.isCancelled { break }
+                    if Task.isCancelled || self.autoScanEpoch != scanEpoch || self.queueEpoch != myQueueEpoch { break }
                     if let idxNow = self.queue.firstIndex(where: { $0.id == targetID }) {
                         self.queue[idxNow].scanError = error.localizedDescription
                     }
@@ -667,9 +781,10 @@ final class AppViewModel: ObservableObject {
                 }
             }
 
-            if !Task.isCancelled {
+            if !Task.isCancelled, self.autoScanEpoch == scanEpoch {
                 self.isPreviewing = false
                 self.activeScanTargetIDs = []
+                self.activePreviewItemKey = nil
                 let scannedCount = self.queue.count - self.unscannedPageCount
                 if !self.queue.isEmpty {
                     self.statusText = self.unscannedPageCount == 0
@@ -700,11 +815,16 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    private func executeBatchScan(to targetURL: URL) {
+    func executeBatchScan(to targetURL: URL) {
         guard let bridge else { return }
         let previousTask = autoScanTask
         stopAutoScanTask()
         activeWorkTask?.cancel()
+        let workToken = UUID()
+        let myTaskEpoch = taskEpoch
+        let myQueueEpoch = queueEpoch
+        activeWorkToken = workToken
+
         let settingsSnapshot = settings
         let logSink = makeLogSink()
         isBusy = true
@@ -715,16 +835,34 @@ final class AppViewModel: ObservableObject {
             await previousTask?.value
             do {
                 try Task.checkCancellation()
+                guard self.taskEpoch == myTaskEpoch, self.queueEpoch == myQueueEpoch else {
+                    throw CancellationError()
+                }
                 let shareOCR = settingsSnapshot.enableOCR && !settingsSnapshot.autoCrop
-                for idx in self.queue.indices where !self.queue[idx].orientationChecked && self.queue[idx].processedPreviewURL == nil {
+                let orientTargetIDs = self.queue
+                    .filter { !$0.orientationChecked && $0.processedPreviewURL == nil }
+                    .map(\.id)
+
+                for targetID in orientTargetIDs {
                     try Task.checkCancellation()
-                    let itemCopy = self.queue[idx]
-                    let targetID = itemCopy.id
+                    guard self.taskEpoch == myTaskEpoch, self.queueEpoch == myQueueEpoch else {
+                        throw CancellationError()
+                    }
+                    guard let idxBefore = self.queue.firstIndex(where: { $0.id == targetID }) else { continue }
+                    let itemCopy = self.queue[idxBefore]
+                    guard !itemCopy.orientationChecked && itemCopy.processedPreviewURL == nil else { continue }
+
                     let deltaDeg = await PDFToolsService.detectReadingOrientationDegreesAsync(
                         for: itemCopy,
                         cacheAccurateOCR: shareOCR
                     )
-                    if let idxNow = self.queue.firstIndex(where: { $0.id == targetID }) {
+                    try Task.checkCancellation()
+                    guard self.taskEpoch == myTaskEpoch, self.queueEpoch == myQueueEpoch else {
+                        throw CancellationError()
+                    }
+                    if let idxNow = self.queue.firstIndex(where: { $0.id == targetID }),
+                       !self.queue[idxNow].orientationChecked,
+                       self.queue[idxNow].rotationDegrees == itemCopy.rotationDegrees {
                         self.queue[idxNow].orientationChecked = true
                         if deltaDeg != 0 {
                             self.queue[idxNow].rotationDegrees = ((self.queue[idxNow].rotationDegrees + deltaDeg) % 360 + 360) % 360
@@ -737,7 +875,13 @@ final class AppViewModel: ObservableObject {
                 }
 
                 try Task.checkCancellation()
+                guard self.taskEpoch == myTaskEpoch, self.queueEpoch == myQueueEpoch else {
+                    throw CancellationError()
+                }
                 let itemsSnapshot = self.queue
+                guard !itemsSnapshot.isEmpty else {
+                    throw PDFToolError.emptyInput("Danh sách trang đang trống.")
+                }
                 self.statusText = settingsSnapshot.enableOCR
                     ? "Đang đóng gói PDF & nhúng lớp OCR (\(itemsSnapshot.count) trang)..."
                     : "Đang đóng gói PDF (\(itemsSnapshot.count) trang)..."
@@ -747,15 +891,20 @@ final class AppViewModel: ObservableObject {
                     outputPDF: targetURL,
                     onLog: logSink
                 )
-                for idx in self.queue.indices {
-                    let itemID = self.queue[idx].id
-                    if let previewURL = batchResult.resolvedURLs[itemID] {
+                try Task.checkCancellation()
+                guard self.taskEpoch == myTaskEpoch, self.queueEpoch == myQueueEpoch else {
+                    throw CancellationError()
+                }
+
+                for item in itemsSnapshot {
+                    guard let idx = self.queue.firstIndex(where: { $0.id == item.id }) else { continue }
+                    if let previewURL = batchResult.resolvedURLs[item.id] {
                         let key = PDFToolsService.previewCacheKey(for: self.queue[idx], settings: settingsSnapshot)
                         self.previewCacheByKey[key] = previewURL
                         self.queue[idx].processedPreviewURL = previewURL
                         self.queue[idx].processedCacheKey = key
                         self.queue[idx].scanError = nil
-                    } else if let err = batchResult.errors[itemID] {
+                    } else if let err = batchResult.errors[item.id] {
                         self.queue[idx].processedPreviewURL = nil
                         self.queue[idx].processedCacheKey = nil
                         self.queue[idx].scanError = err
@@ -779,284 +928,406 @@ final class AppViewModel: ObservableObject {
                     self.appendLog("[WARN] Đã xuất \(targetURL.path) (\(self.lastExportedInfo)), bỏ qua \(errCount) trang lỗi.")
                 }
             } catch is CancellationError {
-                self.statusText = "Đã hủy"
+                if self.taskEpoch == myTaskEpoch {
+                    self.statusText = "Đã hủy"
+                }
             } catch {
-                self.errorMessage = error.localizedDescription
-                self.appendLog("[ERROR] \(error.localizedDescription)")
-                self.showConsole = true
-                self.statusText = "Lỗi xuất PDF"
+                if self.taskEpoch == myTaskEpoch {
+                    self.errorMessage = error.localizedDescription
+                    self.appendLog("[ERROR] \(error.localizedDescription)")
+                    self.showConsole = true
+                    self.statusText = "Lỗi xuất PDF"
+                }
             }
-            self.isBusy = false
-            self.activeWorkTask = nil
+            if self.activeWorkToken == workToken {
+                self.isBusy = false
+                self.activeWorkTask = nil
+                self.activeWorkToken = nil
+            }
         }
     }
 
     func cancelRunningTask() {
         stopAutoScanTask()
-        activeWorkTask?.cancel()
-        activeWorkTask = nil
-        bridge?.cancelActiveProcess()
-        isBusy = false
-        appendLog("[Cancel] Đã gửi tín hiệu dừng tiến trình.")
-        statusText = "Đã hủy"
+        if let work = activeWorkTask {
+            work.cancel()
+            bridge?.cancelActiveProcess()
+            appendLog("[Cancel] Đã gửi tín hiệu dừng tiến trình.")
+            statusText = "Đã hủy"
+        } else {
+            bridge?.cancelActiveProcess()
+            isBusy = false
+            appendLog("[Cancel] Đã gửi tín hiệu dừng tiến trình.")
+            statusText = "Đã hủy"
+        }
     }
 
     // MARK: - Overwrite Safety Checkpoint
 
     func confirmWriteURL(_ targetURL: URL, onProceed: @escaping (URL) -> Void) {
         if FileManager.default.fileExists(atPath: targetURL.path) {
-            pendingOverwrite = PendingOverwriteAction(targetURL: targetURL, onProceed: onProceed)
+            pendingOverwrite = PendingOverwriteAction(
+                targetURL: targetURL,
+                existingCount: 1,
+                onOverwrite: { onProceed(targetURL) },
+                onSaveUnique: { onProceed(PDFToolsService.uniqueURLIfExists(targetURL)) }
+            )
         } else {
             onProceed(targetURL)
         }
     }
 
+    private func confirmDirectoryBatchWrite(
+        plannedFiles: [URL],
+        onProceed: @escaping (_ autoRenameExisting: Bool) -> Void
+    ) {
+        let fm = FileManager.default
+        let existing = plannedFiles.filter { fm.fileExists(atPath: $0.path) }
+        if let firstExisting = existing.first {
+            pendingOverwrite = PendingOverwriteAction(
+                targetURL: firstExisting,
+                existingCount: existing.count,
+                onOverwrite: { onProceed(false) },
+                onSaveUnique: { onProceed(true) }
+            )
+        } else {
+            onProceed(false)
+        }
+    }
+
+    private func runTrackedPDFToolTask<T: Sendable>(
+        busyStatus: String,
+        errorStatus: String,
+        work: @escaping @Sendable () throws -> T,
+        onSuccess: @escaping @MainActor (T) -> Void
+    ) {
+        activeWorkTask?.cancel()
+        let workToken = UUID()
+        let myTaskEpoch = taskEpoch
+        activeWorkToken = workToken
+        isBusy = true
+        statusText = busyStatus
+
+        activeWorkTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try Task.checkCancellation()
+                let detached = Task.detached(priority: .userInitiated) {
+                    try work()
+                }
+                let result = try await withTaskCancellationHandler {
+                    try await detached.value
+                } onCancel: {
+                    detached.cancel()
+                }
+                try Task.checkCancellation()
+                guard self.taskEpoch == myTaskEpoch else {
+                    throw CancellationError()
+                }
+                onSuccess(result)
+            } catch is CancellationError {
+                if self.taskEpoch == myTaskEpoch {
+                    self.statusText = "Đã hủy"
+                }
+            } catch {
+                if self.taskEpoch == myTaskEpoch {
+                    self.errorMessage = error.localizedDescription
+                    self.appendLog("[ERROR] \(error.localizedDescription)")
+                    self.statusText = errorStatus
+                }
+            }
+            if self.activeWorkToken == workToken {
+                self.isBusy = false
+                self.activeWorkTask = nil
+                self.activeWorkToken = nil
+            }
+        }
+    }
+
     // MARK: - PDF Tools Actions
 
-    func runPairFrontAndBack(destinationURL: URL) {
-        guard !isBusy else { return }
-        guard let backURL = pairBackSourceURL else {
+    @discardableResult
+    func validatePairInputs() -> Bool {
+        if pairBackSourceURL == nil {
             errorMessage = "Vui lòng chọn file trang mặt sau (PDF hoặc ảnh)."
-            return
+            return false
         }
-        let frontURL = pairUseQueueAsFront ? nil : pairFrontPDFURL
-        if !pairUseQueueAsFront && frontURL == nil {
+        if !pairUseQueueAsFront && pairFrontPDFURL == nil {
             errorMessage = "Vui lòng chọn file PDF mặt trước hoặc bật 'Dùng danh sách trang hiện tại'."
-            return
+            return false
         }
+        if pairUseQueueAsFront && queue.isEmpty {
+            errorMessage = "Danh sách trang mặt trước đang trống."
+            return false
+        }
+        return true
+    }
+
+    func runPairFrontAndBack(destinationURL: URL, confirmOverwrite: Bool = true) {
+        guard !isBusy else { return }
+        guard validatePairInputs(), let backURL = pairBackSourceURL else { return }
+        let frontURL = pairUseQueueAsFront ? nil : pairFrontPDFURL
+        if let frontURL, validateUnlockedPDF(frontURL) == nil { return }
+        if backURL.pathExtension.lowercased() == "pdf", validateUnlockedPDF(backURL) == nil { return }
+
         let queueSnapshot = queue
         let mode = pairOutputMode
         let prefix = pairFilePrefix
-        let startIdx = pairStartIndex
+        let startIdx = max(1, pairStartIndex)
 
-        let performPair: (URL) -> Void = { [weak self] finalDest in
+        let performPair: (URL, Bool) -> Void = { [weak self] finalDest, autoRename in
             guard let self else { return }
-            self.isBusy = true
-            self.statusText = "Đang ghép cặp trang..."
-            Task.detached(priority: .userInitiated) {
-                do {
-                    let outputs = try PDFToolsService.pairFrontAndBack(
+            self.runTrackedPDFToolTask(
+                busyStatus: "Đang ghép cặp trang...",
+                errorStatus: "Lỗi ghép cặp",
+                work: {
+                    try PDFToolsService.pairFrontAndBack(
                         frontPDFURL: frontURL,
                         queueItems: queueSnapshot,
                         backSourceURL: backURL,
                         outputMode: mode,
                         destinationURL: finalDest,
                         filePrefix: prefix,
-                        startIndex: startIdx
+                        startIndex: startIdx,
+                        autoRenameExisting: autoRename
                     )
-                    await MainActor.run {
-                        self.appendLog("[Pair] Đã tạo \(outputs.count) file PDF tại: \(finalDest.path)")
-                        if outputs.count == 1, let single = outputs.first {
-                            self.lastExportedPDFURL = single
-                            self.lastExportedFolderURL = single.deletingLastPathComponent()
-                            let attrs = try? FileManager.default.attributesOfItem(atPath: single.path)
-                            let bytes = (attrs?[.size] as? Int64) ?? 0
-                            let pCount = PDFDocument(url: single)?.pageCount ?? 0
-                            self.lastExportedInfo = "\(pCount) trang • \(PDFToolsService.formatBytes(bytes))"
-                            self.previewDisplayMode = .pdfResult
-                        } else if let firstOut = outputs.first {
-                            self.lastExportedPDFURL = firstOut
-                            self.lastExportedFolderURL = finalDest
-                            self.lastExportedInfo = "\(outputs.count) file PDF • \(firstOut.lastPathComponent)..."
-                            self.previewDisplayMode = .pdfResult
-                            NSWorkspace.shared.open(finalDest)
-                        }
-                        self.statusText = "Ghép cặp hoàn tất (\(outputs.count) file)"
-                        self.isBusy = false
+                },
+                onSuccess: { outputs in
+                    self.appendLog("[Pair] Đã tạo \(outputs.count) file PDF tại: \(finalDest.path)")
+                    if outputs.count == 1, let single = outputs.first {
+                        self.lastExportedPDFURL = single
+                        self.lastExportedFolderURL = single.deletingLastPathComponent()
+                        let attrs = try? FileManager.default.attributesOfItem(atPath: single.path)
+                        let bytes = (attrs?[.size] as? Int64) ?? 0
+                        let pCount = PDFDocument(url: single)?.pageCount ?? 0
+                        self.lastExportedInfo = "\(pCount) trang • \(PDFToolsService.formatBytes(bytes))"
+                        self.previewDisplayMode = .pdfResult
+                    } else if let firstOut = outputs.first {
+                        self.lastExportedPDFURL = firstOut
+                        self.lastExportedFolderURL = finalDest
+                        self.lastExportedInfo = "\(outputs.count) file PDF • \(firstOut.lastPathComponent)..."
+                        self.previewDisplayMode = .pdfResult
+                        NSWorkspace.shared.open(finalDest)
                     }
-                } catch {
-                    await MainActor.run {
-                        self.errorMessage = error.localizedDescription
-                        self.appendLog("[ERROR] \(error.localizedDescription)")
-                        self.statusText = "Lỗi ghép cặp"
-                        self.isBusy = false
-                    }
+                    self.statusText = "Ghép cặp hoàn tất (\(outputs.count) file)"
                 }
-            }
+            )
         }
 
         if mode == .singleCombined {
-            confirmWriteURL(destinationURL, onProceed: performPair)
+            if confirmOverwrite {
+                confirmWriteURL(destinationURL) { chosenDest in
+                    performPair(chosenDest, false)
+                }
+            } else {
+                performPair(destinationURL, false)
+            }
         } else {
-            performPair(destinationURL)
+            let pageCount = frontURL.flatMap { PDFDocument(url: $0)?.pageCount } ?? queueSnapshot.count
+            let planned = (0..<max(0, pageCount)).map { idx in
+                destinationURL.appendingPathComponent(
+                    PDFToolsService.formatPairFileName(pattern: prefix, startIndex: startIdx, offset: idx)
+                )
+            }
+            if confirmOverwrite {
+                confirmDirectoryBatchWrite(plannedFiles: planned) { autoRename in
+                    performPair(destinationURL, autoRename)
+                }
+            } else {
+                performPair(destinationURL, false)
+            }
         }
     }
 
-    func runSplitPDF(destinationURL: URL) {
-        guard !isBusy, let src = splitSourceURL else {
+    func runSplitPDF(destinationURL: URL, confirmOverwrite: Bool = true) {
+        guard !isBusy else { return }
+        guard let src = splitSourceURL else {
             errorMessage = "Vui lòng chọn file PDF nguồn để tách."
             return
         }
+        guard let doc = validateUnlockedPDF(src) else { return }
         let mode = splitMode
         let range = splitRangeSpec
 
-        let performSplit: (URL) -> Void = { [weak self] finalDest in
+        let performSplit: (URL, Bool) -> Void = { [weak self] finalDest, autoRename in
             guard let self else { return }
-            self.isBusy = true
-            self.statusText = "Đang tách PDF..."
-            Task.detached(priority: .userInitiated) {
-                do {
-                    let outputs = try PDFToolsService.splitPDF(
+            self.runTrackedPDFToolTask(
+                busyStatus: "Đang tách PDF...",
+                errorStatus: "Lỗi tách PDF",
+                work: {
+                    try PDFToolsService.splitPDF(
                         sourceURL: src,
                         mode: mode,
                         rangeSpec: range,
-                        destinationURL: finalDest
+                        destinationURL: finalDest,
+                        autoRenameExisting: autoRename
                     )
-                    await MainActor.run {
-                        self.appendLog("[Split] Đã xuất \(outputs.count) file từ \(src.lastPathComponent)")
-                        if outputs.count == 1, let single = outputs.first {
-                            self.lastExportedPDFURL = single
-                            let attrs = try? FileManager.default.attributesOfItem(atPath: single.path)
-                            let bytes = (attrs?[.size] as? Int64) ?? 0
-                            let pCount = PDFDocument(url: single)?.pageCount ?? 0
-                            self.lastExportedInfo = "\(pCount) trang • \(PDFToolsService.formatBytes(bytes))"
-                            self.previewDisplayMode = .pdfResult
-                        } else {
-                            NSWorkspace.shared.open(finalDest)
-                        }
-                        self.statusText = "Đã tách \(outputs.count) file"
-                        self.isBusy = false
+                },
+                onSuccess: { outputs in
+                    self.appendLog("[Split] Đã xuất \(outputs.count) file từ \(src.lastPathComponent)")
+                    if outputs.count == 1, let single = outputs.first {
+                        self.lastExportedPDFURL = single
+                        self.lastExportedFolderURL = single.deletingLastPathComponent()
+                        let attrs = try? FileManager.default.attributesOfItem(atPath: single.path)
+                        let bytes = (attrs?[.size] as? Int64) ?? 0
+                        let pCount = PDFDocument(url: single)?.pageCount ?? 0
+                        self.lastExportedInfo = "\(pCount) trang • \(PDFToolsService.formatBytes(bytes))"
+                        self.previewDisplayMode = .pdfResult
+                    } else {
+                        self.lastExportedFolderURL = finalDest
+                        NSWorkspace.shared.open(finalDest)
                     }
-                } catch {
-                    await MainActor.run {
-                        self.errorMessage = error.localizedDescription
-                        self.appendLog("[ERROR] \(error.localizedDescription)")
-                        self.statusText = "Lỗi tách PDF"
-                        self.isBusy = false
-                    }
+                    self.statusText = "Đã tách \(outputs.count) file"
                 }
-            }
+            )
         }
 
         if mode == .customRange {
-            confirmWriteURL(destinationURL, onProceed: performSplit)
+            if confirmOverwrite {
+                confirmWriteURL(destinationURL) { chosenDest in
+                    performSplit(chosenDest, false)
+                }
+            } else {
+                performSplit(destinationURL, false)
+            }
         } else {
-            performSplit(destinationURL)
+            let stem = src.deletingPathExtension().lastPathComponent
+            let planned = (0..<doc.pageCount).map { idx in
+                destinationURL.appendingPathComponent(String(format: "%@_page_%02d.pdf", stem, idx + 1))
+            }
+            if confirmOverwrite {
+                confirmDirectoryBatchWrite(plannedFiles: planned) { autoRename in
+                    performSplit(destinationURL, autoRename)
+                }
+            } else {
+                performSplit(destinationURL, false)
+            }
         }
     }
 
-    func runMergeQueue(destinationURL: URL) {
+    func runMergeQueue(destinationURL: URL, confirmOverwrite: Bool = true) {
         guard !isBusy, !queue.isEmpty else { return }
         let itemsSnapshot = queue
-        confirmWriteURL(destinationURL) { [weak self] finalDest in
+        let startMerge: (URL) -> Void = { [weak self] finalDest in
             guard let self else { return }
-            self.isBusy = true
-            self.statusText = "Đang gộp \(itemsSnapshot.count) trang..."
-            Task.detached(priority: .userInitiated) {
-                do {
-                    let count = try PDFToolsService.mergeQueueToPDF(items: itemsSnapshot, destinationURL: finalDest)
-                    await MainActor.run {
-                        let attrs = try? FileManager.default.attributesOfItem(atPath: finalDest.path)
-                        let bytes = (attrs?[.size] as? Int64) ?? 0
-                        self.lastExportedPDFURL = finalDest
-                        self.lastExportedInfo = "\(count) trang • \(PDFToolsService.formatBytes(bytes))"
-                        self.previewDisplayMode = .pdfResult
-                        self.appendLog("[Merge] Đã gộp \(count) trang -> \(finalDest.path)")
-                        self.statusText = "Gộp PDF hoàn tất"
-                        self.isBusy = false
-                    }
-                } catch {
-                    await MainActor.run {
-                        self.errorMessage = error.localizedDescription
-                        self.appendLog("[ERROR] \(error.localizedDescription)")
-                        self.statusText = "Lỗi gộp PDF"
-                        self.isBusy = false
-                    }
+            self.runTrackedPDFToolTask(
+                busyStatus: "Đang gộp \(itemsSnapshot.count) trang...",
+                errorStatus: "Lỗi gộp PDF",
+                work: {
+                    try PDFToolsService.mergeQueueToPDF(items: itemsSnapshot, destinationURL: finalDest)
+                },
+                onSuccess: { count in
+                    let attrs = try? FileManager.default.attributesOfItem(atPath: finalDest.path)
+                    let bytes = (attrs?[.size] as? Int64) ?? 0
+                    self.lastExportedPDFURL = finalDest
+                    self.lastExportedFolderURL = finalDest.deletingLastPathComponent()
+                    self.lastExportedInfo = "\(count) trang • \(PDFToolsService.formatBytes(bytes))"
+                    self.previewDisplayMode = .pdfResult
+                    self.appendLog("[Merge] Đã gộp \(count) trang -> \(finalDest.path)")
+                    self.statusText = "Gộp PDF hoàn tất"
                 }
-            }
+            )
+        }
+        if confirmOverwrite {
+            confirmWriteURL(destinationURL, onProceed: startMerge)
+        } else {
+            startMerge(destinationURL)
         }
     }
 
-    func runMergeExternalPDFs(urls: [URL], destinationURL: URL) {
+    func runMergeExternalPDFs(urls: [URL], destinationURL: URL, confirmOverwrite: Bool = true) {
         guard !isBusy, !urls.isEmpty else { return }
-        confirmWriteURL(destinationURL) { [weak self] finalDest in
+        let startMerge: (URL) -> Void = { [weak self] finalDest in
             guard let self else { return }
-            self.isBusy = true
-            self.statusText = "Đang gộp \(urls.count) file PDF..."
-            Task.detached(priority: .userInitiated) {
-                do {
-                    let count = try PDFToolsService.mergePDFFiles(urls: urls, destinationURL: finalDest)
-                    await MainActor.run {
-                        let attrs = try? FileManager.default.attributesOfItem(atPath: finalDest.path)
-                        let bytes = (attrs?[.size] as? Int64) ?? 0
-                        self.lastExportedPDFURL = finalDest
-                        self.lastExportedInfo = "\(count) trang • \(PDFToolsService.formatBytes(bytes))"
-                        self.previewDisplayMode = .pdfResult
-                        self.appendLog("[Merge] Đã gộp \(urls.count) file (\(count) trang) -> \(finalDest.path)")
-                        self.statusText = "Gộp \(urls.count) PDF hoàn tất"
-                        self.isBusy = false
-                    }
-                } catch {
-                    await MainActor.run {
-                        self.errorMessage = error.localizedDescription
-                        self.appendLog("[ERROR] \(error.localizedDescription)")
-                        self.statusText = "Lỗi gộp PDF"
-                        self.isBusy = false
-                    }
+            self.runTrackedPDFToolTask(
+                busyStatus: "Đang gộp \(urls.count) file PDF...",
+                errorStatus: "Lỗi gộp PDF",
+                work: {
+                    try PDFToolsService.mergePDFFiles(urls: urls, destinationURL: finalDest)
+                },
+                onSuccess: { count in
+                    let attrs = try? FileManager.default.attributesOfItem(atPath: finalDest.path)
+                    let bytes = (attrs?[.size] as? Int64) ?? 0
+                    self.lastExportedPDFURL = finalDest
+                    self.lastExportedFolderURL = finalDest.deletingLastPathComponent()
+                    self.lastExportedInfo = "\(count) trang • \(PDFToolsService.formatBytes(bytes))"
+                    self.previewDisplayMode = .pdfResult
+                    self.appendLog("[Merge] Đã gộp \(urls.count) file (\(count) trang) -> \(finalDest.path)")
+                    self.statusText = "Gộp \(urls.count) PDF hoàn tất"
                 }
-            }
+            )
+        }
+        if confirmOverwrite {
+            confirmWriteURL(destinationURL, onProceed: startMerge)
+        } else {
+            startMerge(destinationURL)
         }
     }
 
-    func runRotatePDF(destinationURL: URL) {
-        guard !isBusy, let src = rotateSourceURL else {
+    func runRotatePDF(destinationURL: URL, confirmOverwrite: Bool = true) {
+        guard !isBusy else { return }
+        guard let src = rotateSourceURL else {
             errorMessage = "Vui lòng chọn file PDF cần xoay."
             return
         }
+        guard validateUnlockedPDF(src) != nil else { return }
         let deg = rotateDegrees
         let autoP = rotateAutoPortrait
         let spec = rotateRangeSpec
 
-        confirmWriteURL(destinationURL) { [weak self] finalDest in
+        let startRotate: (URL) -> Void = { [weak self] finalDest in
             guard let self else { return }
-            self.isBusy = true
-            self.statusText = "Đang xoay PDF..."
-            Task.detached(priority: .userInitiated) {
-                do {
-                    let rotated = try PDFToolsService.rotatePDFFile(
+            self.runTrackedPDFToolTask(
+                busyStatus: "Đang xoay PDF...",
+                errorStatus: "Lỗi xoay PDF",
+                work: {
+                    try PDFToolsService.rotatePDFFile(
                         sourceURL: src,
                         destinationURL: finalDest,
                         clockwiseDegrees: deg,
                         autoPortrait: autoP,
                         rangeSpec: spec
                     )
-                    await MainActor.run {
-                        let attrs = try? FileManager.default.attributesOfItem(atPath: finalDest.path)
-                        let bytes = (attrs?[.size] as? Int64) ?? 0
-                        let pCount = PDFDocument(url: finalDest)?.pageCount ?? 0
-                        self.lastExportedPDFURL = finalDest
-                        self.lastExportedInfo = "\(pCount) trang • \(PDFToolsService.formatBytes(bytes))"
-                        self.previewDisplayMode = .pdfResult
-                        self.appendLog("[Rotate] Đã xoay \(rotated) trang -> \(finalDest.path)")
-                        self.statusText = "Đã xoay \(rotated) trang"
-                        self.isBusy = false
-                    }
-                } catch {
-                    await MainActor.run {
-                        self.errorMessage = error.localizedDescription
-                        self.appendLog("[ERROR] \(error.localizedDescription)")
-                        self.statusText = "Lỗi xoay PDF"
-                        self.isBusy = false
-                    }
+                },
+                onSuccess: { rotated in
+                    let attrs = try? FileManager.default.attributesOfItem(atPath: finalDest.path)
+                    let bytes = (attrs?[.size] as? Int64) ?? 0
+                    let pCount = PDFDocument(url: finalDest)?.pageCount ?? 0
+                    self.lastExportedPDFURL = finalDest
+                    self.lastExportedFolderURL = finalDest.deletingLastPathComponent()
+                    self.lastExportedInfo = "\(pCount) trang • \(PDFToolsService.formatBytes(bytes))"
+                    self.previewDisplayMode = .pdfResult
+                    self.appendLog("[Rotate] Đã xoay \(rotated) trang -> \(finalDest.path)")
+                    self.statusText = "Đã xoay \(rotated) trang"
                 }
-            }
+            )
+        }
+        if confirmOverwrite {
+            confirmWriteURL(destinationURL, onProceed: startRotate)
+        } else {
+            startRotate(destinationURL)
         }
     }
 
-    func runCompressPDF(destinationURL: URL) {
-        guard !isBusy, let bridge, let src = compressSourceURL else {
+    func runCompressPDF(destinationURL: URL, confirmOverwrite: Bool = true) {
+        guard !isBusy, let bridge else { return }
+        guard let src = compressSourceURL else {
             errorMessage = "Vui lòng chọn file PDF cần nén."
             return
         }
+        guard validateUnlockedPDF(src) != nil else { return }
         let dpi = compressDPI
         let qual = compressQuality
         let targetMB = compressTargetMB
         let mode = compressMode
         let autoCrop = compressAutoCrop
 
-        confirmWriteURL(destinationURL) { [weak self] finalDest in
+        let startCompress: (URL) -> Void = { [weak self] finalDest in
             guard let self else { return }
             self.activeWorkTask?.cancel()
+            let workToken = UUID()
+            let myTaskEpoch = self.taskEpoch
+            self.activeWorkToken = workToken
             self.isBusy = true
             self.lastCompressionReport = ""
             self.lastCompressionWarning = ""
@@ -1077,27 +1348,44 @@ final class AppViewModel: ObservableObject {
                         autoCrop: autoCrop,
                         onLog: logSink
                     )
+                    try Task.checkCancellation()
+                    guard self.taskEpoch == myTaskEpoch else {
+                        throw CancellationError()
+                    }
                     let beforeStr = PDFToolsService.formatBytes(res.beforeBytes)
                     let afterStr = PDFToolsService.formatBytes(res.afterBytes)
                     let summary = String(format: "Trước: %@ → Sau: %@ (Giảm %.1f%%)", beforeStr, afterStr, res.savedPercent)
                     self.lastCompressionReport = res.detailsMessage.isEmpty ? summary : "\(summary)\n\(res.detailsMessage)"
                     self.lastCompressionWarning = res.targetAchieved ? "" : "Chưa đạt mục tiêu dung lượng nhưng đã giữ nguyên text vector và độ đọc."
                     self.lastExportedPDFURL = finalDest
+                    self.lastExportedFolderURL = finalDest.deletingLastPathComponent()
                     self.lastExportedInfo = "\(res.pageCount) trang • \(afterStr)"
                     self.previewDisplayMode = .pdfResult
                     self.appendLog("[Compress] \(summary) | \(res.detailsMessage)")
                     self.statusText = "Nén PDF hoàn tất"
                 } catch is CancellationError {
-                    self.statusText = "Đã hủy nén PDF"
+                    if self.taskEpoch == myTaskEpoch {
+                        self.statusText = "Đã hủy nén PDF"
+                    }
                 } catch {
-                    self.errorMessage = error.localizedDescription
-                    self.appendLog("[ERROR] \(error.localizedDescription)")
-                    self.showConsole = true
-                    self.statusText = "Lỗi nén PDF"
+                    if self.taskEpoch == myTaskEpoch {
+                        self.errorMessage = error.localizedDescription
+                        self.appendLog("[ERROR] \(error.localizedDescription)")
+                        self.showConsole = true
+                        self.statusText = "Lỗi nén PDF"
+                    }
                 }
-                self.isBusy = false
-                self.activeWorkTask = nil
+                if self.activeWorkToken == workToken {
+                    self.isBusy = false
+                    self.activeWorkTask = nil
+                    self.activeWorkToken = nil
+                }
             }
+        }
+        if confirmOverwrite {
+            confirmWriteURL(destinationURL, onProceed: startCompress)
+        } else {
+            startCompress(destinationURL)
         }
     }
 }

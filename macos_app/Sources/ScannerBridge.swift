@@ -50,41 +50,63 @@ struct BatchScanResult {
     let errors: [UUID: String]
 }
 
+private let ignoreSIGPIPEOnce: Void = {
+    signal(SIGPIPE, SIG_IGN)
+}()
+
 private final class LinePipeAccumulator: @unchecked Sendable {
     private let lock = NSLock()
-    private var remainder = ""
+    private var byteBuffer = Data()
     private let prefix: String
-    private let onLog: (String) -> Void
+    private let onLog: @Sendable (String) -> Void
 
-    init(prefix: String, onLog: @escaping (String) -> Void) {
+    init(prefix: String, onLog: @escaping @Sendable (String) -> Void) {
         self.prefix = prefix
         self.onLog = onLog
     }
 
     func append(_ data: Data) {
-        guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
+        guard !data.isEmpty else { return }
+        var completedLines: [String] = []
         lock.lock()
-        remainder.append(chunk)
-        let lines = remainder.components(separatedBy: "\n")
-        remainder = lines.last ?? ""
+        byteBuffer.append(data)
+        var searchStart = byteBuffer.startIndex
+        while let nlIndex = byteBuffer[searchStart...].firstIndex(of: 0x0A) {
+            let lineSlice = byteBuffer[searchStart..<nlIndex]
+            let clean = String(decoding: lineSlice, as: UTF8.self)
+                .trimmingCharacters(in: .newlines)
+            if !clean.isEmpty {
+                completedLines.append(prefix.isEmpty ? clean : "\(prefix)\(clean)")
+            }
+            searchStart = byteBuffer.index(after: nlIndex)
+        }
+        if searchStart > byteBuffer.startIndex {
+            byteBuffer.removeSubrange(byteBuffer.startIndex..<searchStart)
+        }
         lock.unlock()
 
-        for line in lines.dropLast() {
-            let clean = line.trimmingCharacters(in: .newlines)
-            if !clean.isEmpty {
-                onLog(prefix.isEmpty ? clean : "\(prefix)\(clean)")
-            }
+        for line in completedLines {
+            onLog(line)
         }
     }
 
     func flush(trailingData: Data) {
-        append(trailingData)
+        if !trailingData.isEmpty {
+            append(trailingData)
+        }
+        let left: String?
         lock.lock()
-        let left = remainder.trimmingCharacters(in: .whitespacesAndNewlines)
-        remainder = ""
+        if !byteBuffer.isEmpty {
+            let decoded = String(decoding: byteBuffer, as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            byteBuffer.removeAll()
+            left = decoded.isEmpty ? nil : (prefix.isEmpty ? decoded : "\(prefix)\(decoded)")
+        } else {
+            left = nil
+        }
         lock.unlock()
-        if !left.isEmpty {
-            onLog(prefix.isEmpty ? left : "\(prefix)\(left)")
+        if let left {
+            onLog(left)
         }
     }
 }
@@ -114,6 +136,23 @@ private struct WorkerJobResponse: Decodable {
     let height: Int?
 }
 
+private final class JobCancelState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+}
+
 private final class PersistentPythonWorker: @unchecked Sendable {
     private let pythonURL: URL
     private let pythonFlags: [String]
@@ -126,7 +165,7 @@ private final class PersistentPythonWorker: @unchecked Sendable {
     private var process: Process?
     private var stdinHandle: FileHandle?
     private var stdoutHandle: FileHandle?
-    private var logHandler: ((String) -> Void)?
+    private var logHandler: (@Sendable (String) -> Void)?
 
     init(
         pythonURL: URL,
@@ -135,6 +174,7 @@ private final class PersistentPythonWorker: @unchecked Sendable {
         environment: [String: String],
         workingDirectory: URL
     ) {
+        _ = ignoreSIGPIPEOnce
         self.pythonURL = pythonURL
         self.pythonFlags = pythonFlags
         self.scriptURL = scriptURL
@@ -149,12 +189,14 @@ private final class PersistentPythonWorker: @unchecked Sendable {
     func terminate() {
         stateLock.lock()
         let proc = process
+        let inH = stdinHandle
         process = nil
         stdinHandle = nil
         stdoutHandle = nil
         logHandler = nil
         stateLock.unlock()
 
+        try? inH?.close()
         if let proc, proc.isRunning {
             proc.terminate()
         }
@@ -178,24 +220,29 @@ private final class PersistentPythonWorker: @unchecked Sendable {
         proc.standardOutput = outPipe
         proc.standardError = errPipe
 
-        errPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        let errAccumulator = LinePipeAccumulator(prefix: "") { [weak self] cleanLine in
+            guard let self else { return }
+            self.stateLock.lock()
+            let sink = self.logHandler
+            self.stateLock.unlock()
+            sink?(cleanLine)
+        }
+
+        errPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            self?.stateLock.lock()
-            let sink = self?.logHandler
-            self?.stateLock.unlock()
-            for raw in text.components(separatedBy: "\n") {
-                let clean = raw.trimmingCharacters(in: .newlines)
-                if !clean.isEmpty {
-                    sink?(clean)
-                }
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                errAccumulator.flush(trailingData: Data())
+            } else {
+                errAccumulator.append(data)
             }
         }
 
-        proc.terminationHandler = { [weak self] _ in
+        proc.terminationHandler = { [weak self] finishedProc in
             errPipe.fileHandleForReading.readabilityHandler = nil
+            errAccumulator.flush(trailingData: Data())
             self?.stateLock.lock()
-            if self?.process === proc {
+            if self?.process === finishedProc {
                 self?.process = nil
                 self?.stdinHandle = nil
                 self?.stdoutHandle = nil
@@ -203,7 +250,13 @@ private final class PersistentPythonWorker: @unchecked Sendable {
             self?.stateLock.unlock()
         }
 
-        try proc.run()
+        do {
+            try proc.run()
+        } catch {
+            errPipe.fileHandleForReading.readabilityHandler = nil
+            proc.terminationHandler = nil
+            throw error
+        }
         self.process = proc
         self.stdinHandle = inPipe.fileHandleForWriting
         self.stdoutHandle = outPipe.fileHandleForReading
@@ -226,11 +279,12 @@ private final class PersistentPythonWorker: @unchecked Sendable {
 
     func runJob(
         payload: [String: Any],
-        onLog: @escaping (String) -> Void
+        onLog: @escaping @Sendable (String) -> Void
     ) async throws -> WorkerJobResponse {
+        try Task.checkCancellation()
         let reqData = try JSONSerialization.data(withJSONObject: payload, options: [])
-        var lineData = reqData
-        lineData.append(0x0A)
+        let lineData = reqData + Data([0x0A])
+        let cancelState = JobCancelState()
 
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -239,36 +293,79 @@ private final class PersistentPythonWorker: @unchecked Sendable {
                         continuation.resume(throwing: CancellationError())
                         return
                     }
+                    if cancelState.isCancelled {
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
+
                     do {
-                        self.stateLock.lock()
-                        self.logHandler = onLog
-                        try self.ensureRunningLocked()
-                        guard let inH = self.stdinHandle, let outH = self.stdoutHandle else {
-                            self.stateLock.unlock()
-                            throw ScannerBridgeError.processFailed(-1, "Không khởi chạy được worker Python.")
-                        }
-                        self.stateLock.unlock()
+                        let (inH, outH): (FileHandle, FileHandle) = try {
+                            self.stateLock.lock()
+                            defer { self.stateLock.unlock() }
+                            if cancelState.isCancelled {
+                                throw CancellationError()
+                            }
+                            self.logHandler = onLog
+                            try self.ensureRunningLocked()
+                            guard let inH = self.stdinHandle, let outH = self.stdoutHandle else {
+                                throw ScannerBridgeError.processFailed(-1, "Không khởi chạy được worker Python.")
+                            }
+                            return (inH, outH)
+                        }()
 
                         try inH.write(contentsOf: lineData)
                         guard let respData = self.readJSONLine(from: outH) else {
-                            self.terminate()
+                            if cancelState.isCancelled {
+                                throw CancellationError()
+                            }
                             throw ScannerBridgeError.processFailed(-1, "Worker Python đóng kết nối đột ngột.")
                         }
                         let decoded = try JSONDecoder().decode(WorkerJobResponse.self, from: respData)
+                        self.stateLock.lock()
+                        self.logHandler = nil
+                        self.stateLock.unlock()
                         continuation.resume(returning: decoded)
                     } catch {
                         self.terminate()
-                        continuation.resume(throwing: error)
+                        continuation.resume(throwing: cancelState.isCancelled ? CancellationError() : error)
                     }
                 }
             }
         } onCancel: { [weak self] in
+            cancelState.cancel()
             self?.terminate()
         }
     }
 }
 
-final class ScannerBridge {
+private final class ProcessRunState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    private var resumed = false
+    let process = Process()
+
+    func markCancelled() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func claimResume() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !resumed else { return false }
+        resumed = true
+        return true
+    }
+}
+
+final class ScannerBridge: @unchecked Sendable {
     let workspaceRoot: URL
     let pythonURL: URL
     let bundledPythonRoot: URL?
@@ -278,11 +375,13 @@ final class ScannerBridge {
     let docScannerScript: URL
     let precompiledDocScannerURL: URL?
 
-    private var activeProcess: Process?
+    private var activeInvocation: ProcessRunState?
     private let processLock = NSLock()
+    private let workerLock = NSLock()
     private var persistentWorker: PersistentPythonWorker?
 
     init() throws {
+        _ = ignoreSIGPIPEOnce
         let root = try Self.discoverWorkspaceRoot()
         self.workspaceRoot = root
         self.batchScannerScript = root.appendingPathComponent("scripts/batch_scanner.py")
@@ -296,7 +395,6 @@ final class ScannerBridge {
     }
 
     deinit {
-        persistentWorker?.terminate()
         cancelActiveProcess()
     }
 
@@ -332,9 +430,21 @@ final class ScannerBridge {
     private static func discoverPython(root: URL) -> (pythonURL: URL, bundledRoot: URL?) {
         let fm = FileManager.default
         let bundledRoot = root.appendingPathComponent("python_runtime")
-        let bundledPy = bundledRoot.appendingPathComponent("bin/python3.10")
-        if fm.isExecutableFile(atPath: bundledPy.path) {
-            return (bundledPy, bundledRoot)
+        let bundledBinDir = bundledRoot.appendingPathComponent("bin")
+        if let binEntries = try? fm.contentsOfDirectory(
+            at: bundledBinDir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) {
+            let pyBins = binEntries
+                .filter {
+                    let name = $0.lastPathComponent
+                    return (name == "python3" || name.hasPrefix("python3.")) && fm.isExecutableFile(atPath: $0.path)
+                }
+                .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedDescending }
+            if let bundledPy = pyBins.first {
+                return (bundledPy, bundledRoot)
+            }
         }
         let candidates = [
             root.appendingPathComponent(".venv/bin/python3").path,
@@ -349,18 +459,50 @@ final class ScannerBridge {
         return (URL(fileURLWithPath: "/usr/bin/python3"), nil)
     }
 
+    private func getOrCreatePersistentWorker() -> PersistentPythonWorker {
+        workerLock.lock()
+        defer { workerLock.unlock() }
+        if let existing = persistentWorker {
+            return existing
+        }
+        let worker = PersistentPythonWorker(
+            pythonURL: pythonURL,
+            pythonFlags: pythonIsolationFlags,
+            scriptURL: batchScannerScript,
+            environment: configuredPythonEnvironment(),
+            workingDirectory: workspaceRoot
+        )
+        persistentWorker = worker
+        return worker
+    }
+
     func terminateWorkers() {
-        persistentWorker?.terminate()
+        workerLock.lock()
+        let worker = persistentWorker
         persistentWorker = nil
+        workerLock.unlock()
+        worker?.terminate()
     }
 
     func cancelActiveProcess() {
         terminateWorkers()
         processLock.lock()
-        let proc = activeProcess
+        let inv = activeInvocation
+        inv?.markCancelled()
+        let proc = inv?.process
         processLock.unlock()
         if let proc, proc.isRunning {
             proc.terminate()
+        }
+    }
+
+    private func cancelInvocationIfActive(_ state: ProcessRunState) {
+        state.markCancelled()
+        processLock.lock()
+        let shouldTerminate = (activeInvocation === state)
+        processLock.unlock()
+        if shouldTerminate && state.process.isRunning {
+            state.process.terminate()
         }
     }
 
@@ -395,9 +537,17 @@ final class ScannerBridge {
         probeProc.standardOutput = outPipe
         probeProc.standardError = errPipe
 
+        final class PipeDataBox: @unchecked Sendable {
+            var data = Data()
+        }
+        let outBox = PipeDataBox()
+        let errBox = PipeDataBox()
+        let ioGroup = DispatchGroup()
+        let outHandle = outPipe.fileHandleForReading
+        let errHandle = errPipe.fileHandleForReading
+
         do {
             try probeProc.run()
-            probeProc.waitUntilExit()
         } catch {
             return PreflightReport(
                 isHealthy: false,
@@ -411,15 +561,31 @@ final class ScannerBridge {
             )
         }
 
-        let outStr = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let errStr = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        ioGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            outBox.data = outHandle.readDataToEndOfFile()
+            ioGroup.leave()
+        }
+        ioGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            errBox.data = errHandle.readDataToEndOfFile()
+            ioGroup.leave()
+        }
+        ioGroup.wait()
+        probeProc.waitUntilExit()
 
-        if probeProc.terminationStatus == 0 {
-            let parts = outStr.split(separator: "|", maxSplits: 1).map(String.init)
-            let pyVer = parts.first ?? "?"
-            let cvVer = parts.count > 1 ? parts[1] : "?"
+        let outStr = String(decoding: outBox.data, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let errStr = String(decoding: errBox.data, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let parts = outStr.split(separator: "|", maxSplits: 1).map(String.init)
+        if probeProc.terminationStatus == 0,
+           parts.count == 2,
+           !parts[0].isEmpty,
+           !parts[1].isEmpty {
+            let pyVer = parts[0]
+            let cvVer = parts[1]
             let runtimeLabel = bundledPythonRoot != nil ? "Bundled Python \(pyVer)" : "Python \(pyVer)"
             return PreflightReport(
                 isHealthy: true,
@@ -506,7 +672,7 @@ final class ScannerBridge {
     }
 
     private static func canonicalPath(_ url: URL) -> String {
-        url.standardizedFileURL.resolvingSymlinksInPath().path
+        url.standardizedFileURL.resolvingSymlinksInPath().path.precomposedStringWithCanonicalMapping
     }
 
     private func decodeManifest(at manifestURL: URL) throws -> PipelineManifest {
@@ -517,8 +683,9 @@ final class ScannerBridge {
     func previewSinglePage(
         item: InputPageItem,
         settings: ScanSettings,
-        onLog: @escaping (String) -> Void
+        onLog: @escaping @Sendable (String) -> Void
     ) async throws -> URL {
+        try Task.checkCancellation()
         let fm = FileManager.default
         let workDir = fm.temporaryDirectory.appendingPathComponent("pdfscanner_preview_\(UUID().uuidString)")
         let stageDir = workDir.appendingPathComponent("stage")
@@ -537,15 +704,7 @@ final class ScannerBridge {
             guard fm.fileExists(atPath: batchScannerScript.path) else {
                 throw ScannerBridgeError.scriptNotFound(batchScannerScript.path)
             }
-            if persistentWorker == nil {
-                persistentWorker = PersistentPythonWorker(
-                    pythonURL: pythonURL,
-                    pythonFlags: pythonIsolationFlags,
-                    scriptURL: batchScannerScript,
-                    environment: configuredPythonEnvironment(),
-                    workingDirectory: workspaceRoot
-                )
-            }
+            let worker = getOrCreatePersistentWorker()
             let payload: [String: Any] = [
                 "id": item.id.uuidString,
                 "input": staged.path,
@@ -562,7 +721,7 @@ final class ScannerBridge {
                 "min_confidence": settings.minConfidence,
                 "jpeg_quality": settings.jpegQuality
             ]
-            let resp = try await persistentWorker!.runJob(payload: payload, onLog: onLog)
+            let resp = try await worker.runJob(payload: payload, onLog: onLog)
             if resp.status != "ok" {
                 let msg = (resp.message?.isEmpty == false) ? resp.message! : "Không tạo được ảnh xem trước."
                 throw ScannerBridgeError.pageProcessingFailed(msg)
@@ -578,6 +737,8 @@ final class ScannerBridge {
                     settings: settings,
                     onLog: onLog
                 )
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 if fm.fileExists(atPath: manifestURL.path),
                    let manifest = try? decodeManifest(at: manifestURL),
@@ -624,8 +785,9 @@ final class ScannerBridge {
         items: [InputPageItem],
         settings: ScanSettings,
         outputPDF: URL,
-        onLog: @escaping (String) -> Void
+        onLog: @escaping @Sendable (String) -> Void
     ) async throws -> BatchScanResult {
+        try Task.checkCancellation()
         guard !items.isEmpty else {
             throw PDFToolError.emptyInput("Danh sách trang đang trống.")
         }
@@ -639,7 +801,7 @@ final class ScannerBridge {
 
         for (idx, item) in items.enumerated() {
             let expectedKey = PDFToolsService.previewCacheKey(for: item, settings: settings)
-            let keyValid = (item.processedCacheKey == nil || item.processedCacheKey == expectedKey)
+            let keyValid = (item.processedCacheKey == expectedKey)
             if keyValid, let cached = item.processedPreviewURL, fm.fileExists(atPath: cached.path) {
                 resolvedMap[item.id] = cached
             } else {
@@ -706,12 +868,21 @@ final class ScannerBridge {
                     settings: settings,
                     onLog: onLog
                 )
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 pipelineFailure = error
             }
+            try Task.checkCancellation()
 
             if fm.fileExists(atPath: manifestURL.path) {
-                let manifest = try decodeManifest(at: manifestURL)
+                let manifest: PipelineManifest
+                do {
+                    manifest = try decodeManifest(at: manifestURL)
+                } catch {
+                    if let pipelineFailure { throw pipelineFailure }
+                    throw error
+                }
                 let cacheDir = Self.previewCacheDirectory
                 try fm.createDirectory(at: cacheDir, withIntermediateDirectories: true)
 
@@ -779,7 +950,7 @@ final class ScannerBridge {
         targetMB: Double = 0.0,
         mode: EnhanceMode = .original,
         autoCrop: Bool = false,
-        onLog: @escaping (String) -> Void
+        onLog: @escaping @Sendable (String) -> Void
     ) async throws -> CompressionResult {
         let fm = FileManager.default
         guard fm.fileExists(atPath: pdfCompressorScript.path) else {
@@ -849,7 +1020,7 @@ final class ScannerBridge {
         emitDir: URL,
         manifestURL: URL,
         settings: ScanSettings,
-        onLog: @escaping (String) -> Void
+        onLog: @escaping @Sendable (String) -> Void
     ) async throws {
         let executable: URL
         var args: [String] = []
@@ -929,11 +1100,14 @@ final class ScannerBridge {
         arguments: [String],
         environment: [String: String],
         workingDirectory: URL,
-        onLog: @escaping (String) -> Void
+        onLog: @escaping @Sendable (String) -> Void
     ) async throws -> Int32 {
-        try await withTaskCancellationHandler {
+        try Task.checkCancellation()
+        let state = ProcessRunState()
+
+        return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                let process = Process()
+                let process = state.process
                 process.executableURL = executableURL
                 process.arguments = arguments
                 process.environment = environment
@@ -947,49 +1121,86 @@ final class ScannerBridge {
                 let outAccumulator = LinePipeAccumulator(prefix: "", onLog: onLog)
                 let errAccumulator = LinePipeAccumulator(prefix: "[stderr] ", onLog: onLog)
 
+                let ioGroup = DispatchGroup()
+                ioGroup.enter()
                 outPipe.fileHandleForReading.readabilityHandler = { handle in
                     let data = handle.availableData
-                    outAccumulator.append(data)
+                    if data.isEmpty {
+                        handle.readabilityHandler = nil
+                        ioGroup.leave()
+                    } else {
+                        outAccumulator.append(data)
+                    }
                 }
 
+                ioGroup.enter()
                 errPipe.fileHandleForReading.readabilityHandler = { handle in
                     let data = handle.availableData
-                    errAccumulator.append(data)
+                    if data.isEmpty {
+                        handle.readabilityHandler = nil
+                        ioGroup.leave()
+                    } else {
+                        errAccumulator.append(data)
+                    }
                 }
 
                 process.terminationHandler = { proc in
+                    _ = ioGroup.wait(timeout: .now() + 2.0)
                     outPipe.fileHandleForReading.readabilityHandler = nil
                     errPipe.fileHandleForReading.readabilityHandler = nil
 
-                    let tailOut = (try? outPipe.fileHandleForReading.readToEnd()) ?? Data()
-                    let tailErr = (try? errPipe.fileHandleForReading.readToEnd()) ?? Data()
-
-                    outAccumulator.flush(trailingData: tailOut)
-                    errAccumulator.flush(trailingData: tailErr)
+                    outAccumulator.flush(trailingData: Data())
+                    errAccumulator.flush(trailingData: Data())
 
                     self.processLock.lock()
-                    self.activeProcess = nil
+                    if self.activeInvocation === state {
+                        self.activeInvocation = nil
+                    }
                     self.processLock.unlock()
 
-                    continuation.resume(returning: proc.terminationStatus)
+                    guard state.claimResume() else { return }
+                    if state.isCancelled {
+                        continuation.resume(throwing: CancellationError())
+                    } else {
+                        continuation.resume(returning: proc.terminationStatus)
+                    }
                 }
 
                 do {
                     self.processLock.lock()
-                    self.activeProcess = process
+                    if Task.isCancelled || state.isCancelled {
+                        if self.activeInvocation === state {
+                            self.activeInvocation = nil
+                        }
+                        self.processLock.unlock()
+                        outPipe.fileHandleForReading.readabilityHandler = nil
+                        errPipe.fileHandleForReading.readabilityHandler = nil
+                        process.terminationHandler = nil
+                        if state.claimResume() {
+                            continuation.resume(throwing: CancellationError())
+                        }
+                        return
+                    }
+                    self.activeInvocation = state
                     self.processLock.unlock()
+
                     try process.run()
                 } catch {
                     self.processLock.lock()
-                    self.activeProcess = nil
+                    if self.activeInvocation === state {
+                        self.activeInvocation = nil
+                    }
                     self.processLock.unlock()
                     outPipe.fileHandleForReading.readabilityHandler = nil
                     errPipe.fileHandleForReading.readabilityHandler = nil
-                    continuation.resume(throwing: error)
+                    process.terminationHandler = nil
+                    if state.claimResume() {
+                        continuation.resume(throwing: state.isCancelled ? CancellationError() : error)
+                    }
                 }
             }
         } onCancel: {
-            self.cancelActiveProcess()
+            self.cancelInvocationIfActive(state)
         }
     }
 }

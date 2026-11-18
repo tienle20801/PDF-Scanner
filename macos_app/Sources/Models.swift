@@ -229,9 +229,9 @@ struct ScanSettings: Equatable {
     /// Q9: Optional invisible Vision OCR text layer (off by default to prioritize speed; does not alter enhanced pixels).
     var enableOCR: Bool = false
 
-    /// Signature of settings that affect enhanced image pixels (excludes pure PDF layout & OCR controls).
+    /// Signature of settings that affect enhanced image pixels (excludes pure OCR controls).
     var imageProcessingSignature: String {
-        let resBucket = (pageSize == .fit) ? "fit" : "dpi_\(dpi)"
+        let marginBucket = (pageSize == .fit) ? "m0.0" : String(format: "m%.1f", margin)
         return [
             engine.rawValue,
             mode.rawValue,
@@ -242,7 +242,9 @@ struct ScanSettings: Equatable {
             balanceSymmetry ? "sym1" : "sym0",
             String(format: "mc%.2f", minConfidence),
             "jq\(jpegQuality)",
-            resBucket
+            pageSize.rawValue,
+            "dpi_\(dpi)",
+            marginBucket
         ].joined(separator: "|")
     }
 }

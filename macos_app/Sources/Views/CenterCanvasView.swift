@@ -75,10 +75,12 @@ struct CenterCanvasView: View {
                         HStack(spacing: 6) {
                             Button("Đổi file...", action: onAddFiles)
                                 .controlSize(.small)
+                                .disabled(vm.isBusy)
                             Button("Xóa") {
                                 vm.resetCurrentTaskToNewBatch()
                             }
                             .controlSize(.small)
+                            .disabled(vm.isBusy)
                         }
                     }
                 }

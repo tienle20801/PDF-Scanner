@@ -91,7 +91,8 @@ struct ContentView: View {
             vm.terminateWorkers()
         }
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
-            handleDrop(providers: providers)
+            guard !vm.isBusy else { return false }
+            return handleDrop(providers: providers)
         }
         .alert(
             "File PDF đã tồn tại",
@@ -102,22 +103,24 @@ struct ContentView: View {
             presenting: vm.pendingOverwrite
         ) { pending in
             Button("Ghi đè file cũ", role: .destructive) {
-                let action = pending.onProceed
-                let url = pending.targetURL
+                let overwrite = pending.onOverwrite
                 vm.pendingOverwrite = nil
-                action(url)
+                overwrite()
             }
             Button("Lưu tên mới (_1, _2...)") {
-                let unique = PDFToolsService.uniqueURLIfExists(pending.targetURL)
-                let action = pending.onProceed
+                let saveUnique = pending.onSaveUnique
                 vm.pendingOverwrite = nil
-                action(unique)
+                saveUnique()
             }
             Button("Hủy", role: .cancel) {
                 vm.pendingOverwrite = nil
             }
         } message: { pending in
-            Text("\"\(pending.targetURL.lastPathComponent)\" đã có trên đĩa. Bạn muốn ghi đè hay tự động lưu bản mới?")
+            if pending.existingCount > 1 {
+                Text("Thư mục đích đã có \(pending.existingCount) file trùng tên (vd: \"\(pending.targetURL.lastPathComponent)\"). Bạn muốn ghi đè hay tự động lưu bản mới (_1, _2...)?")
+            } else {
+                Text("\"\(pending.targetURL.lastPathComponent)\" đã có trên đĩa. Bạn muốn ghi đè hay tự động lưu bản mới?")
+            }
         }
         .alert(
             "Tab \(vm.activeTask.title) chỉ nhận file PDF",
@@ -145,15 +148,32 @@ struct ContentView: View {
         }
     }
 
+    private final class LockedURLCollector: @unchecked Sendable {
+        private let lock = NSLock()
+        private var urls: [URL] = []
+
+        func append(_ url: URL) {
+            lock.lock()
+            urls.append(url)
+            lock.unlock()
+        }
+
+        func snapshot() -> [URL] {
+            lock.lock()
+            defer { lock.unlock() }
+            return urls
+        }
+    }
+
     private func handleDrop(providers: [NSItemProvider]) -> Bool {
+        guard !vm.isBusy else { return false }
         let validProviders = providers.filter {
             $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
         }
         guard !validProviders.isEmpty else { return false }
 
         let group = DispatchGroup()
-        let lock = NSLock()
-        var droppedURLs: [URL] = []
+        let collector = LockedURLCollector()
 
         for provider in validProviders {
             group.enter()
@@ -166,14 +186,13 @@ struct ContentView: View {
                     resolvedURL = url
                 }
                 if let url = resolvedURL {
-                    lock.lock()
-                    droppedURLs.append(url)
-                    lock.unlock()
+                    collector.append(url)
                 }
             }
         }
 
         group.notify(queue: .main) {
+            let droppedURLs = collector.snapshot()
             if !droppedURLs.isEmpty {
                 vm.handleDroppedURLs(droppedURLs)
             }
@@ -182,6 +201,7 @@ struct ContentView: View {
     }
 
     private func pickInputFilesOrFolders() {
+        guard !vm.isBusy else { return }
         let panel = NSOpenPanel()
         panel.title = vm.activeTask.dropzonePrimaryButtonTitle
         panel.canChooseFiles = true

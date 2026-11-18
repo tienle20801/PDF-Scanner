@@ -191,6 +191,7 @@ struct SwiftPhase1Tests {
         var cachedItems = items
         for idx in cachedItems.indices {
             cachedItems[idx].processedPreviewURL = resUncached.resolvedURLs[cachedItems[idx].id]
+            cachedItems[idx].processedCacheKey = PDFToolsService.previewCacheKey(for: cachedItems[idx], settings: settings)
         }
         let cachedPDF = tmpRoot.appendingPathComponent("cached_a4.pdf")
         let resCached = try await bridge.runBatchScan(items: cachedItems, settings: settings, outputPDF: cachedPDF) { _ in }
@@ -282,8 +283,16 @@ struct SwiftPhase1Tests {
         let kFit = PDFToolsService.previewCacheKey(for: sampleItem, settings: sFit)
         let kBW = PDFToolsService.previewCacheKey(for: sampleItem, settings: sBW)
         let kQ60 = PDFToolsService.previewCacheKey(for: sampleItem, settings: sQ60)
+        var sA4OCR = sA4
+        sA4OCR.enableOCR = true
+        let kA4OCR = PDFToolsService.previewCacheKey(for: sampleItem, settings: sA4OCR)
+        var sA4Margin = sA4
+        sA4Margin.margin = 48.0
+        let kA4Margin = PDFToolsService.previewCacheKey(for: sampleItem, settings: sA4Margin)
 
-        assertEqual(kA4, kLetter, "A4 <-> Letter & margin change must keep same preview cache key")
+        assertEqual(kA4, kA4OCR, "Toggling enableOCR must keep same preview cache key")
+        assertTrue(kA4 != kLetter, "Changing pageSize (A4 -> Letter) must change preview cache key")
+        assertTrue(kA4 != kA4Margin, "Changing margin must change preview cache key")
         assertTrue(kA4 != kFit, "Switching to Fit must change cache key")
         assertTrue(kA4 != kBW, "Changing mode must change cache key")
         assertTrue(kA4 != kQ60, "Changing jpegQuality must change cache key")
@@ -401,6 +410,380 @@ struct SwiftPhase1Tests {
                 }
             }
         }
+
+        // 11. Sprint 1/2 P0 & P1 & P2 Regression Tests
+        try await runSprint1RegressionTests(tmpRoot: tmpRoot, repoRoot: repoRoot, bridge: bridge)
+    }
+
+    static func runSprint1RegressionTests(tmpRoot: URL, repoRoot: URL, bridge: ScannerBridge) async throws {
+        let fm = FileManager.default
+
+        // 11a. [P1-4 + P2] formatPairFileName path traversal, Unicode \p{L} boundary, startIndex >= 1, containment
+        assertEqual(PDFToolsService.formatPairFileName(pattern: "../../escaped_xx", startIndex: 1, offset: 0), "escaped_01.pdf", "P1-4 strip ../ traversal")
+        assertEqual(PDFToolsService.formatPairFileName(pattern: "../..", startIndex: 1, offset: 0), "page_01.pdf", "P1-4 bare .. fallback")
+        assertEqual(PDFToolsService.formatPairFileName(pattern: "a\\b\\c_xx", startIndex: -5, offset: 0), "c_01.pdf", "P1-4 backslash + negative startIndex clamp")
+        assertEqual(PDFToolsService.formatPairFileName(pattern: "xác_nhận", startIndex: 1, offset: 0), "xác_nhận_01.pdf", "P2 Unicode letter boundary keeps xác_nhận intact")
+        assertEqual(PDFToolsService.formatPairFileName(pattern: "xa\u{0301}c_nha\u{0323}\u{0302}n_xx", startIndex: 2, offset: 0), "xác_nhận_02.pdf", "P2 NFD Vietnamese pattern preserves word and matches xx")
+
+        let pairParent = tmpRoot.appendingPathComponent("pair_containment")
+        let pairDest = pairParent.appendingPathComponent("nested")
+        try fm.createDirectory(at: pairDest, withIntermediateDirectories: true)
+        let frontImg = pairParent.appendingPathComponent("front.png")
+        let backImg = pairParent.appendingPathComponent("back.png")
+        saveImage(makeSyntheticImage(width: 400, height: 600, rgb: (0.2, 0.2, 0.8)), to: frontImg, utType: .png)
+        saveImage(makeSyntheticImage(width: 400, height: 600, rgb: (0.8, 0.2, 0.2)), to: backImg, utType: .png)
+        let frontItem = InputPageItem(sourceURL: frontImg, displayName: "front.png")
+        let pairOuts = try PDFToolsService.pairFrontAndBack(
+            frontPDFURL: nil,
+            queueItems: [frontItem],
+            backSourceURL: backImg,
+            outputMode: .separateFiles,
+            destinationURL: pairDest,
+            filePrefix: "../../escaped_xx",
+            startIndex: 1
+        )
+        assertEqual(pairOuts.count, 1, "P1-4 pair should create 1 file")
+        assertTrue(!fm.fileExists(atPath: pairParent.appendingPathComponent("escaped_01.pdf").path), "P1-4 must NOT escape pairDest")
+        assertTrue(fm.fileExists(atPath: pairDest.appendingPathComponent("escaped_01.pdf").path), "P1-4 must write inside pairDest")
+
+        // 11b. [P1-5 + P2] Symlink traversal in expandURLsWithFolderMeta, stageItemToImageFile, and resolved mtime in cache keys
+        let realTargetDir = tmpRoot.appendingPathComponent("real_sym_target")
+        let symFolder = tmpRoot.appendingPathComponent("sym_folder")
+        try fm.createDirectory(at: realTargetDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: symFolder, withIntermediateDirectories: true)
+        let realTargetImg = realTargetDir.appendingPathComponent("target_photo.png")
+        saveImage(makeSyntheticImage(width: 400, height: 500, rgb: (0.1, 0.7, 0.2)), to: realTargetImg, utType: .png)
+        let relativeSym = symFolder.appendingPathComponent("linked_photo.png")
+        try fm.createSymbolicLink(atPath: relativeSym.path, withDestinationPath: "../real_sym_target/target_photo.png")
+
+        let expandedMeta = PDFToolsService.expandURLsWithFolderMeta([symFolder])
+        assertEqual(expandedMeta.count, 1, "P1-5 expandURLsWithFolderMeta must include symlinked file inside folder")
+        assertEqual(expandedMeta.first?.folderName, "sym_folder", "P1-5 preserve folderName")
+
+        let symStageDir = tmpRoot.appendingPathComponent("sym_stage")
+        try fm.createDirectory(at: symStageDir, withIntermediateDirectories: true)
+        let symItem = InputPageItem(sourceURL: relativeSym, displayName: "linked_photo.png")
+        let symStaged = try PDFToolsService.stageItemToImageFile(item: symItem, index: 0, stagingDir: symStageDir)
+        assertTrue(fm.isReadableFile(atPath: symStaged.path), "P1-5 staged file from relative symlink must be readable")
+        let stagedAttrs = try fm.attributesOfItem(atPath: symStaged.path)
+        assertTrue((stagedAttrs[.type] as? FileAttributeType) == .typeRegular, "P1-5 staged file must be regular file, not symlink")
+
+        let keyBeforeMtime = PDFToolsService.previewCacheKey(for: symItem, settings: ScanSettings())
+        let ocrKeyBeforeMtime = PDFToolsService.ocrCacheKey(for: relativeSym)
+        try fm.setAttributes([.modificationDate: Date().addingTimeInterval(120)], ofItemAtPath: realTargetImg.path)
+        let keyAfterMtime = PDFToolsService.previewCacheKey(for: symItem, settings: ScanSettings())
+        let ocrKeyAfterMtime = PDFToolsService.ocrCacheKey(for: relativeSym)
+        assertTrue(keyBeforeMtime != keyAfterMtime, "P2 previewCacheKey must reflect resolved target mtime")
+        assertTrue(ocrKeyBeforeMtime != ocrKeyAfterMtime, "P2 ocrCacheKey must reflect resolved target mtime")
+
+        // 11c. [P1-16] Locked (password-protected) PDF must be rejected across loadInputItems & PDFToolsService
+        let unlockedSrcPDF = tmpRoot.appendingPathComponent("for_lock.pdf")
+        try makeVectorTextPDF(text: "Secret Content", to: unlockedSrcPDF)
+        let lockedPDF = tmpRoot.appendingPathComponent("locked.pdf")
+        let lockDoc = PDFDocument(url: unlockedSrcPDF)!
+        assertTrue(
+            lockDoc.write(to: lockedPDF, withOptions: [
+                PDFDocumentWriteOption.userPasswordOption: "userpass123",
+                PDFDocumentWriteOption.ownerPasswordOption: "ownerpass123"
+            ]),
+            "Create user-password locked PDF"
+        )
+        assertEqual(PDFToolsService.loadInputItems(from: [lockedPDF]).count, 0, "P1-16 loadInputItems must return 0 items for locked PDF")
+
+        func assertThrows(_ label: String, _ block: () throws -> Void) {
+            var didThrow = false
+            do { try block() } catch { didThrow = true }
+            assertTrue(didThrow, label)
+        }
+        assertThrows("P1-16 splitPDF rejects locked PDF") {
+            _ = try PDFToolsService.splitPDF(sourceURL: lockedPDF, mode: .customRange, rangeSpec: "1", destinationURL: tmpRoot.appendingPathComponent("locked_split.pdf"))
+        }
+        assertThrows("P1-16 pairFrontAndBack rejects locked front PDF") {
+            _ = try PDFToolsService.pairFrontAndBack(frontPDFURL: lockedPDF, queueItems: [], backSourceURL: backImg, outputMode: .singleCombined, destinationURL: tmpRoot.appendingPathComponent("locked_pair.pdf"), filePrefix: "p", startIndex: 1)
+        }
+        assertThrows("P1-16 pairFrontAndBack rejects locked back PDF") {
+            _ = try PDFToolsService.pairFrontAndBack(frontPDFURL: unlockedSrcPDF, queueItems: [], backSourceURL: lockedPDF, outputMode: .singleCombined, destinationURL: tmpRoot.appendingPathComponent("locked_pair2.pdf"), filePrefix: "p", startIndex: 1)
+        }
+        assertThrows("P1-16 mergePDFFiles rejects locked PDF") {
+            _ = try PDFToolsService.mergePDFFiles(urls: [lockedPDF], destinationURL: tmpRoot.appendingPathComponent("locked_merge.pdf"))
+        }
+        assertThrows("P1-16 rotatePDFFile rejects locked PDF") {
+            _ = try PDFToolsService.rotatePDFFile(sourceURL: lockedPDF, destinationURL: tmpRoot.appendingPathComponent("locked_rot.pdf"), clockwiseDegrees: 90, autoPortrait: false, rangeSpec: "1")
+        }
+
+        // 11d. [P1-17] Transparent RGBA PNG must composite over white in stageItemToImageFile & PureSwiftVision (--no-crop)
+        let alphaPNG = tmpRoot.appendingPathComponent("transparent_border.png")
+        let alphaW = 400, alphaH = 400
+        let alphaCtx = CGContext(
+            data: nil, width: alphaW, height: alphaH, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )!
+        alphaCtx.clear(CGRect(x: 0, y: 0, width: alphaW, height: alphaH))
+        alphaCtx.setFillColor(CGColor(red: 0.15, green: 0.25, blue: 0.85, alpha: 1.0))
+        alphaCtx.fill(CGRect(x: 120, y: 120, width: 160, height: 160))
+        saveImage(alphaCtx.makeImage()!, to: alphaPNG, utType: .png)
+
+        let alphaItem = InputPageItem(sourceURL: alphaPNG, displayName: "transparent_border.png")
+        let alphaStaged = try PDFToolsService.stageItemToImageFile(item: alphaItem, index: 0, stagingDir: symStageDir)
+        let stagedCorner = samplePixelRGB(atX: 5, y: 5, inImageAt: alphaStaged)
+        assertTrue(stagedCorner.r >= 245 && stagedCorner.g >= 245 && stagedCorner.b >= 245, "P1-17 staged transparent PNG corner must be white, got \(stagedCorner)")
+
+        var visionNoCrop = ScanSettings()
+        visionNoCrop.engine = .pureSwiftVision
+        visionNoCrop.mode = .original
+        visionNoCrop.autoCrop = false
+        let alphaPreview = try await bridge.previewSinglePage(item: alphaItem, settings: visionNoCrop) { _ in }
+        let previewCorner = samplePixelRGB(atX: 5, y: 5, inImageAt: alphaPreview)
+        assertTrue(previewCorner.r >= 245 && previewCorner.g >= 245 && previewCorner.b >= 245, "P1-17 PureSwiftVision transparent PNG corner must be white, got \(previewCorner)")
+
+        // 11e. [P1-3 + P2] Compile and invoke doc_scanner.swift directly: NFC canonicalization on NFD input & sanitized --save-debug stem
+        let docScannerBin = tmpRoot.appendingPathComponent("doc_scanner_bin")
+        let compileProc = Process()
+        compileProc.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
+        compileProc.arguments = [
+            "-O", "-framework", "Foundation", "-framework", "CoreImage",
+            "-framework", "CoreGraphics", "-framework", "ImageIO", "-framework", "Vision",
+            repoRoot.appendingPathComponent("scripts/doc_scanner.swift").path,
+            "-o", docScannerBin.path
+        ]
+        try compileProc.run()
+        compileProc.waitUntilExit()
+        assertEqual(compileProc.terminationStatus, 0, "Compile doc_scanner.swift")
+
+        let nfdName = "nga\u{0300}y (test) #1.png"
+        let nfcName = nfdName.precomposedStringWithCanonicalMapping
+        let nfdFile = tmpRoot.appendingPathComponent(nfdName)
+        let nfcFile = tmpRoot.appendingPathComponent(nfcName)
+        saveImage(makeSyntheticImage(width: 500, height: 700, rgb: (0.1, 0.2, 0.7)), to: nfdFile, utType: .png)
+        let nfcManifest = tmpRoot.appendingPathComponent("nfc_manifest.json")
+        let debugDir = tmpRoot.appendingPathComponent("debug_out")
+        let docOut = tmpRoot.appendingPathComponent("doc_nfc.pdf")
+        let runDoc = Process()
+        runDoc.executableURL = docScannerBin
+        runDoc.arguments = [
+            "--output", docOut.path,
+            "--no-crop",
+            "--manifest", nfcManifest.path,
+            "--save-debug", debugDir.path,
+            nfdFile.path
+        ]
+        try runDoc.run()
+        runDoc.waitUntilExit()
+        assertEqual(runDoc.terminationStatus, 0, "doc_scanner run on NFD filename")
+        let mData = try Data(contentsOf: nfcManifest)
+        let mDecoded = try JSONDecoder().decode(PipelineManifest.self, from: mData)
+        let expectedCanonNFC = nfcFile.standardizedFileURL.resolvingSymlinksInPath().path.precomposedStringWithCanonicalMapping
+        assertEqual(mDecoded.results.first?.input, expectedCanonNFC, "P1-3 doc_scanner manifest input must be NFC canonical path")
+        let debugEntries = (try? fm.contentsOfDirectory(atPath: debugDir.path)) ?? []
+        assertTrue(debugEntries.count == 1 && !debugEntries[0].contains(" ") && !debugEntries[0].contains("#"), "P2 --save-debug stem must be sanitized (got \(debugEntries))")
+        assertEqual(PDFToolsService.ocrCacheKey(for: nfdFile), PDFToolsService.ocrCacheKey(for: nfcFile), "P1-3 ocrCacheKey identical for NFD and NFC")
+        assertEqual(PDFToolsService.previewCacheKey(for: InputPageItem(sourceURL: nfdFile, displayName: "n"), settings: ScanSettings()),
+                    PDFToolsService.previewCacheKey(for: InputPageItem(sourceURL: nfcFile, displayName: "n"), settings: ScanSettings()),
+                    "P1-3 previewCacheKey identical for NFD and NFC")
+
+        // 11f. [P2] compileProcessedImagesToPDF atomic write: mid-batch failure leaves no partial PDF or corrupt sentinel
+        let atomicOut = tmpRoot.appendingPathComponent("atomic_sentinel.pdf")
+        let sentinelBytes = Data("SENTINEL_INTACT".utf8)
+        try sentinelBytes.write(to: atomicOut)
+        let missingImg = tmpRoot.appendingPathComponent("does_not_exist.jpg")
+        assertThrows("P2 compileProcessedImagesToPDF throws on missing image") {
+            try PDFToolsService.compileProcessedImagesToPDF(imageURLs: [frontImg, missingImg], destinationURL: atomicOut, settings: ScanSettings())
+        }
+        assertEqual(try Data(contentsOf: atomicOut), sentinelBytes, "P2 failed compileProcessedImagesToPDF must not corrupt existing destination")
+
+        // 11g. [P1-18] processedPreviewURL with processedCacheKey == nil MUST be treated as cache MISS
+        let cleanItem = InputPageItem(sourceURL: frontImg, displayName: "front.png")
+        var cleanSettings = ScanSettings()
+        cleanSettings.engine = .pureSwiftVision
+        cleanSettings.mode = .clean
+        cleanSettings.autoCrop = false
+        let cleanPrev = try await bridge.previewSinglePage(item: cleanItem, settings: cleanSettings) { _ in }
+        var staleItem = cleanItem
+        staleItem.processedPreviewURL = cleanPrev
+        staleItem.processedCacheKey = nil
+        var bwSettings = cleanSettings
+        bwSettings.mode = .bw
+        let bwOut = tmpRoot.appendingPathComponent("p18_bw.pdf")
+        let p18Res = try await bridge.runBatchScan(items: [staleItem], settings: bwSettings, outputPDF: bwOut) { _ in }
+        let resolvedP18 = p18Res.resolvedURLs[staleItem.id]!
+        assertTrue(resolvedP18.path != cleanPrev.path, "P1-18 nil processedCacheKey must NOT reuse stale preview")
+
+        // 11h. Mock-root ScannerBridge tests: P0-2 deadlock, P1-15 pre-cancel, P1-13 UTF-8 pipe, P1-14 preflight >256KB, P1-7 SIGTERM cancel, P2 python3.* glob
+        defer { setenv("PDF_SCANNER_ROOT", repoRoot.path, 1) }
+
+        // P0-2: Invalid executable python3.10 fails proc.run() -> must throw rapidly without NSLock deadlock
+        let badRoot = tmpRoot.appendingPathComponent("mock_bad_worker")
+        try fm.createDirectory(at: badRoot.appendingPathComponent("scripts"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: badRoot.appendingPathComponent("python_runtime/bin"), withIntermediateDirectories: true)
+        try Data("# dummy\n".utf8).write(to: badRoot.appendingPathComponent("scripts/batch_scanner.py"))
+        try Data("# dummy\n".utf8).write(to: badRoot.appendingPathComponent("scripts/pdf_compressor.py"))
+        try Data("print(\"hi\")\n".utf8).write(to: badRoot.appendingPathComponent("scripts/doc_scanner.swift"))
+        let badPy = badRoot.appendingPathComponent("python_runtime/bin/python3.10")
+        try Data().write(to: badPy) // 0-byte executable causes ENOEXEC on proc.run()
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: badPy.path)
+
+        setenv("PDF_SCANNER_ROOT", badRoot.path, 1)
+        let badBridge = try ScannerBridge()
+        var badSettings = ScanSettings()
+        badSettings.engine = .hybridOpenCV
+        var p02Threw = false
+        let tStartP02 = Date()
+        do {
+            _ = try await badBridge.previewSinglePage(item: frontItem, settings: badSettings) { _ in }
+        } catch {
+            p02Threw = true
+        }
+        assertTrue(p02Threw, "P0-2 bad worker launch must throw instead of succeeding")
+        assertTrue(Date().timeIntervalSince(tStartP02) < 5.0, "P0-2 bad worker launch must not deadlock")
+
+        // P1-15: Pre-cancelled Task calling previewSinglePage must throw CancellationError without running worker
+        let preCancelTask = Task<Void, Error> {
+            withUnsafeCurrentTask { $0?.cancel() }
+            _ = try await badBridge.previewSinglePage(item: frontItem, settings: badSettings) { _ in }
+        }
+        var p15Cancelled = false
+        do {
+            try await preCancelTask.value
+        } catch is CancellationError {
+            p15Cancelled = true
+        } catch {
+            p15Cancelled = false
+        }
+        assertTrue(p15Cancelled, "P1-15 pre-cancelled Task must throw CancellationError")
+
+        // P2 discoverPython python3.11 + P1-14 >280KB stderr preflight + P1-13 split UTF-8 chunks + P1-7 SIGTERM cancel
+        let mockRoot = tmpRoot.appendingPathComponent("mock_good_worker")
+        try fm.createDirectory(at: mockRoot.appendingPathComponent("scripts"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: mockRoot.appendingPathComponent("python_runtime/bin"), withIntermediateDirectories: true)
+        try Data("# dummy\n".utf8).write(to: mockRoot.appendingPathComponent("scripts/batch_scanner.py"))
+        try Data("# dummy\n".utf8).write(to: mockRoot.appendingPathComponent("scripts/pdf_compressor.py"))
+        try Data("print(\"hi\")\n".utf8).write(to: mockRoot.appendingPathComponent("scripts/doc_scanner.swift"))
+
+        let realPy = bridge.pythonURL.path
+        let mockPy11 = mockRoot.appendingPathComponent("python_runtime/bin/python3.11")
+        let mockImpl = mockRoot.appendingPathComponent("mock_impl.py")
+        let mockImplScript = """
+        import os, sys, time, json, shutil
+        args = sys.argv[1:]
+        if "-c" in args:
+            # P1-14: emit 280 KiB to stderr before printing version to stdout
+            sys.stderr.write("W" * 286720 + "\\n")
+            sys.stderr.flush()
+            sys.stdout.write("3.11.9|4.10.0\\n")
+            sys.stdout.flush()
+            sys.exit(0)
+        if any("sleep_cancel" in a for a in args):
+            time.sleep(10)
+            sys.exit(0)
+        if any("utf8_stress" in a for a in args):
+            line = "CỘNG HÒA XÃ HỘI CHỦ NGHĨA VIỆT NAM - dòng ".encode("utf-8")
+            for i in range(4000):
+                payload = line + f"{i:04d}\\n".encode("utf-8")
+                # Split mid-UTF-8 byte sequence across two writes
+                os.write(1, payload[:5])
+                os.write(1, payload[5:])
+            p_idx = next(i for i, a in enumerate(args) if a.endswith("pdf_compressor.py"))
+            src_pdf = args[p_idx + 1]
+            dst_pdf = args[p_idx + 2]
+            shutil.copy2(src_pdf, dst_pdf)
+            rep_idx = args.index("--json-report") + 1
+            with open(args[rep_idx], "w", encoding="utf-8") as f:
+                json.dump({
+                    "before_bytes": 100,
+                    "after_bytes": 50,
+                    "pages": 1,
+                    "vector_pages": 1,
+                    "image_pages": 0,
+                    "recompressed_images": 0,
+                    "target_bytes": 0,
+                    "target_achieved": True,
+                    "used_dpi": 150,
+                    "used_quality": 80,
+                    "message": "ok"
+                }, f)
+            sys.exit(0)
+        sys.exit(0)
+        """
+        try Data(mockImplScript.utf8).write(to: mockImpl)
+        let mockWrapper = """
+        #!/bin/sh
+        unset PYTHONHOME PYTHONPATH
+        exec "\(realPy)" "\(mockImpl.path)" "$@"
+        """
+        try Data(mockWrapper.utf8).write(to: mockPy11)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: mockPy11.path)
+
+        setenv("PDF_SCANNER_ROOT", mockRoot.path, 1)
+        let mockBridge = try ScannerBridge()
+        assertEqual(mockBridge.pythonURL.lastPathComponent, "python3.11", "P2 discoverPython must detect python3.11 dynamically")
+
+        let tPreflight = Date()
+        let pf = mockBridge.runPreflightCheck()
+        assertTrue(pf.isHealthy, "P1-14 preflight with 280 KiB stderr must succeed cleanly (got: \(pf.summary))")
+        assertTrue(Date().timeIntervalSince(tPreflight) < 5.0, "P1-14 preflight must not deadlock on >256KB stderr")
+
+        final class LineCollector: @unchecked Sendable {
+            private let lock = NSLock()
+            private var lines: [String] = []
+            func append(_ line: String) {
+                lock.lock()
+                lines.append(line)
+                lock.unlock()
+            }
+            func snapshot() -> [String] {
+                lock.lock()
+                defer { lock.unlock() }
+                return lines
+            }
+        }
+        let collector = LineCollector()
+        let utf8InPDF = tmpRoot.appendingPathComponent("utf8_stress_in.pdf")
+        let utf8OutPDF = tmpRoot.appendingPathComponent("utf8_stress_out.pdf")
+        try makeVectorTextPDF(text: "UTF8 Stress", to: utf8InPDF)
+        _ = try await mockBridge.compressPDF(sourcePDF: utf8InPDF, outputPDF: utf8OutPDF) { line in
+            if line.hasPrefix("CỘNG HÒA") {
+                collector.append(line)
+            }
+        }
+        let receivedLines = collector.snapshot()
+        assertEqual(receivedLines.count, 4000, "P1-13 LinePipeAccumulator must deliver all 4000 split UTF-8 lines")
+        assertTrue(!receivedLines.contains(where: { $0.contains("\u{FFFD}") }), "P1-13 must not produce UTF-8 replacement characters")
+
+        // P1-7: Intentional cancellation during compressPDF throws CancellationError (not processFailed(15))
+        let sleepInPDF = tmpRoot.appendingPathComponent("sleep_cancel_in.pdf")
+        let sleepOutPDF = tmpRoot.appendingPathComponent("sleep_cancel_out.pdf")
+        try makeVectorTextPDF(text: "Cancel Test", to: sleepInPDF)
+        let cancelTask = Task {
+            try await mockBridge.compressPDF(sourcePDF: sleepInPDF, outputPDF: sleepOutPDF) { _ in }
+        }
+        try await Task.sleep(nanoseconds: 150_000_000)
+        cancelTask.cancel()
+        mockBridge.cancelActiveProcess()
+        var threwCancellation = false
+        do {
+            _ = try await cancelTask.value
+        } catch is CancellationError {
+            threwCancellation = true
+        } catch {
+            assertTrue(false, "P1-7 expected CancellationError on cancel, got \(error)")
+        }
+        assertTrue(threwCancellation, "P1-7 intentional cancel must throw CancellationError")
+    }
+
+    static func samplePixelRGB(atX x: Int, y: Int, inImageAt url: URL) -> (r: Int, g: Int, b: Int) {
+        let src = CGImageSourceCreateWithURL(url as CFURL, nil)!
+        let cg = CGImageSourceCreateImageAtIndex(src, 0, nil)!
+        let w = cg.width, h = cg.height
+        var buf = [UInt8](repeating: 0, count: w * h * 4)
+        let ctx = CGContext(
+            data: &buf, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )!
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        let cx = min(max(0, x), w - 1)
+        let cy = min(max(0, y), h - 1)
+        let off = (cy * w + cx) * 4
+        return (Int(buf[off]), Int(buf[off + 1]), Int(buf[off + 2]))
     }
 
     static func makeOCRTextCGImage(lines: [String], skewRadians: CGFloat = 0.0) throws -> CGImage {

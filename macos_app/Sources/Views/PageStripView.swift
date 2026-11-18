@@ -17,6 +17,7 @@ struct CompactPageStripView: View {
                         .font(.caption)
                 }
                 .buttonStyle(.borderless)
+                .disabled(vm.isBusy || vm.queue.isEmpty)
                 .help("Xoay tất cả trang 90° sang phải")
 
                 Button(role: .destructive) {
@@ -26,6 +27,7 @@ struct CompactPageStripView: View {
                         .font(.caption)
                 }
                 .buttonStyle(.borderless)
+                .disabled(vm.isBusy || vm.queue.isEmpty)
                 .help("Xóa toàn bộ danh sách")
             }
             .padding(.horizontal, 10)
@@ -42,6 +44,7 @@ struct CompactPageStripView: View {
                             total: vm.queue.count,
                             item: item,
                             isSelected: vm.selectedItem?.id == item.id,
+                            isBusy: vm.isBusy,
                             onSelect: { vm.selectItem(item.id) },
                             onRotateLeft: { vm.rotateItem(id: item.id, deltaDegrees: -90) },
                             onRotateRight: { vm.rotateItem(id: item.id, deltaDegrees: 90) },
@@ -63,6 +66,7 @@ struct CompactPageStripView: View {
                     .padding(.vertical, 6)
             }
             .buttonStyle(.borderless)
+            .disabled(vm.isBusy)
             .background(.bar)
         }
         .background(Color(nsColor: .windowBackgroundColor))
@@ -74,6 +78,7 @@ struct CompactPageCard: View {
     let total: Int
     let item: InputPageItem
     let isSelected: Bool
+    let isBusy: Bool
     let onSelect: () -> Void
     let onRotateLeft: () -> Void
     let onRotateRight: () -> Void
@@ -153,12 +158,14 @@ struct CompactPageCard: View {
                     Image(systemName: "rotate.left").font(.system(size: 10))
                 }
                 .buttonStyle(.borderless)
+                .disabled(isBusy)
                 .help("Xoay trái 90°")
 
                 Button(action: onRotateRight) {
                     Image(systemName: "rotate.right").font(.system(size: 10))
                 }
                 .buttonStyle(.borderless)
+                .disabled(isBusy)
                 .help("Xoay phải 90°")
 
                 Spacer()
@@ -167,18 +174,19 @@ struct CompactPageCard: View {
                     Image(systemName: "chevron.up").font(.system(size: 10))
                 }
                 .buttonStyle(.borderless)
-                .disabled(index == 0)
+                .disabled(isBusy || index == 0)
 
                 Button(action: onMoveDown) {
                     Image(systemName: "chevron.down").font(.system(size: 10))
                 }
                 .buttonStyle(.borderless)
-                .disabled(index >= total - 1)
+                .disabled(isBusy || index >= total - 1)
 
                 Button(role: .destructive, action: onDelete) {
                     Image(systemName: "xmark").font(.system(size: 10))
                 }
                 .buttonStyle(.borderless)
+                .disabled(isBusy)
                 .help("Xóa trang")
             }
             .foregroundStyle(.secondary)
