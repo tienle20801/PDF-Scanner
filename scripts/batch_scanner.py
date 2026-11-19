@@ -473,78 +473,42 @@ def _smooth_edge_curve(raw_offsets: np.ndarray, points_per_edge: int, max_val: i
     return np.clip(curve, 0.0, float(max_val))
 
 
-def _extract_edge_offsets(
-    bg_mask: np.ndarray, strip_depth: int, side: str, points_per_edge: int
-) -> np.ndarray:
-    """Extract inward background depth along one edge ('top', 'bottom', 'left', 'right')."""
-    h, w = bg_mask.shape
-    if side in ("top", "bottom"):
-        strip = bg_mask[:strip_depth, :] if side == "top" else bg_mask[h - strip_depth :, :]
-        if side == "bottom":
-            strip = strip[::-1, :]
-        axis_len = w
-    else:
-        strip = bg_mask[:, :strip_depth] if side == "left" else bg_mask[:, w - strip_depth :]
-        if side == "right":
-            strip = strip[:, ::-1]
-        strip = strip.T.copy()  # transpose so outer edge is row 0
-        # Prevent top/bottom border bleed from smearing into left/right edge curves near page corners
-        tb_ignore = min(strip.shape[1] // 8, max(6, int(0.02 * h)))
-        strip[:, :tb_ignore] = 0
-        strip[:, -tb_ignore:] = 0
-        axis_len = h
-
-    closed = cv2.morphologyEx(strip, cv2.MORPH_CLOSE, _KERNEL_3x5)
-    opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, _KERNEL_2x15)
-
-    _, labels = cv2.connectedComponents(opened)
-    border_labels = set(np.unique(labels[0, :])) - {0}
-    if not border_labels:
-        return np.zeros(axis_len, dtype=np.float32)
-
-    connected = np.isin(labels, list(border_labels))
-    offsets = np.zeros(axis_len, dtype=np.float32)
-    ys, xs = np.where(connected)
-    if ys.size > 0:
-        np.maximum.at(offsets, xs, ys + 1)
-    return _smooth_edge_curve(offsets, points_per_edge, strip_depth)
-
-
-def _estimate_paper_stats(
-    image: np.ndarray,
-    need_hsv: bool = True,
-) -> tuple[np.ndarray, np.ndarray | None, float, float, float, np.ndarray]:
-    """Return (lab, hsv_or_none, l_paper, a_paper, b_paper, paper_bgr) from inner 8%..92% frame."""
+def _estimate_paper_scalars(image: np.ndarray) -> tuple[float, float, float, np.ndarray]:
+    """Estimate (l_paper, a_paper, b_paper, paper_bgr) from a strided inner 8%..92% subsample."""
     h, w = image.shape[:2]
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV) if need_hsv else None
+    step = max(1, max(h, w) // 500)
+    small = image[::step, ::step]
+    sh, sw = small.shape[:2]
+    y0 = int(0.08 * sh)
+    y1 = max(y0 + 1, int(0.92 * sh))
+    x0 = int(0.08 * sw)
+    x1 = max(x0 + 1, int(0.92 * sw))
 
-    y0, y1 = int(0.08 * h), int(0.92 * h)
-    x0, x1 = int(0.08 * w), int(0.92 * w)
-    inner_lab = lab[y0:y1, x0:x1]
+    inner_bgr = small[y0:y1, x0:x1]
+    inner_lab = cv2.cvtColor(inner_bgr, cv2.COLOR_BGR2LAB)
     l_paper = float(np.percentile(inner_lab[:, :, 0], 80))
     a_paper = float(np.median(inner_lab[:, :, 1]))
     b_paper = float(np.median(inner_lab[:, :, 2]))
 
-    inner_bgr = image[y0:y1, x0:x1]
     paper_px = inner_bgr[inner_lab[:, :, 0] >= l_paper - 10]
     paper_bgr = (
         np.median(paper_px, axis=0).astype(np.uint8)
         if paper_px.size > 0
         else np.array([245, 245, 245], dtype=np.uint8)
     )
-    return lab, hsv, l_paper, a_paper, b_paper, paper_bgr
+    return l_paper, a_paper, b_paper, paper_bgr
 
 
-def _compute_bg_and_paper(
-    image: np.ndarray,
-    stats: tuple[np.ndarray, np.ndarray | None, float, float, float, np.ndarray] | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return (is_bg_mask, chroma_diff, saturation, paper_bgr)."""
-    if stats is None or stats[1] is None:
-        stats = _estimate_paper_stats(image, need_hsv=True)
-    lab, hsv, l_paper, a_paper, b_paper, paper_bgr = stats
-
+def _compute_strip_bg_mask(
+    strip_bgr: np.ndarray,
+    l_paper: float,
+    a_paper: float,
+    b_paper: float,
+    include_dark_tb: bool = False,
+) -> np.ndarray:
+    """Detect non-paper border background pixels on an edge strip or downscaled seed."""
+    lab = cv2.cvtColor(strip_bgr, cv2.COLOR_BGR2LAB)
+    hsv = cv2.cvtColor(strip_bgr, cv2.COLOR_BGR2HSV)
     L = lab[:, :, 0].astype(np.float32)
     a = lab[:, :, 1].astype(np.float32)
     b = lab[:, :, 2].astype(np.float32)
@@ -558,7 +522,52 @@ def _compute_bg_and_paper(
         | ((dark_diff > 22.0) & (chroma_diff > 5.5))
         | ((L < 90) & (chroma_diff > 5.5))
     ).astype(np.uint8) * 255
-    return is_bg, chroma_diff, S, paper_bgr
+    if include_dark_tb:
+        dark_tb_raw = (L < min(148.0, l_paper - 58.0)).astype(np.uint8) * 255
+        dark_tb = cv2.morphologyEx(dark_tb_raw, cv2.MORPH_OPEN, _KERNEL_2x15)
+        is_bg = cv2.bitwise_or(is_bg, dark_tb)
+    return is_bg
+
+
+def _extract_strip_edge_offsets(
+    strip_mask: np.ndarray,
+    side: str,
+    points_per_edge: int,
+    full_h: int,
+) -> np.ndarray:
+    """Extract inward background depth along one oriented edge strip ('top', 'bottom', 'left', 'right')."""
+    if side == "top":
+        strip = strip_mask
+    elif side == "bottom":
+        strip = strip_mask[::-1, :]
+    elif side == "left":
+        strip = strip_mask.T.copy()
+        tb_ignore = min(strip.shape[1] // 8, max(6, int(0.02 * full_h)))
+        if tb_ignore > 0:
+            strip[:, :tb_ignore] = 0
+            strip[:, -tb_ignore:] = 0
+    else:
+        strip = strip_mask[:, ::-1].T.copy()
+        tb_ignore = min(strip.shape[1] // 8, max(6, int(0.02 * full_h)))
+        if tb_ignore > 0:
+            strip[:, :tb_ignore] = 0
+            strip[:, -tb_ignore:] = 0
+
+    axis_len = strip.shape[1]
+    closed = cv2.morphologyEx(strip, cv2.MORPH_CLOSE, _KERNEL_3x5)
+    opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, _KERNEL_2x15)
+
+    _, labels = cv2.connectedComponents(opened)
+    border_labels = set(np.unique(labels[0, :])) - {0}
+    if not border_labels:
+        return np.zeros(axis_len, dtype=np.float32)
+
+    connected = np.isin(labels, list(border_labels))
+    offsets = np.zeros(axis_len, dtype=np.float32)
+    ys, xs = np.where(connected)
+    if ys.size > 0:
+        np.maximum.at(offsets, xs, ys + 1)
+    return _smooth_edge_curve(offsets, points_per_edge, strip.shape[0])
 
 
 def _clean_residual_border_bleed(
@@ -570,7 +579,7 @@ def _clean_residual_border_bleed(
     """Clean thin residual background bleed touching the outer 1.5% border."""
     h, w = image.shape[:2]
     if a_paper is None or b_paper is None or paper_bgr is None:
-        _, _, _, a_paper, b_paper, paper_bgr = _estimate_paper_stats(image, need_hsv=False)
+        _, a_paper, b_paper, paper_bgr = _estimate_paper_scalars(image)
 
     out = image.copy()
     v_depth = max(4, int(0.015 * h))
@@ -615,20 +624,25 @@ def multipoint_border_mask_clean(image: np.ndarray, points_per_edge: int = 32) -
     if h < 120 or w < 120:
         return image
 
-    stats = _estimate_paper_stats(image, need_hsv=True)
-    lab, _, l_paper, a_paper, b_paper, paper_bgr = stats
-    is_bg, _, _, _ = _compute_bg_and_paper(image, stats=stats)
-    dark_tb_raw = (lab[:, :, 0].astype(np.float32) < min(148.0, l_paper - 58.0)).astype(np.uint8) * 255
-    dark_tb = cv2.morphologyEx(dark_tb_raw, cv2.MORPH_OPEN, _KERNEL_2x15)
-    is_bg_tb = cv2.bitwise_or(is_bg, dark_tb)
-
+    l_paper, a_paper, b_paper, paper_bgr = _estimate_paper_scalars(image)
     tb_depth = max(8, int(0.055 * h))
     lr_depth = max(8, int(0.045 * w))
 
-    y_top = _extract_edge_offsets(is_bg_tb, tb_depth, "top", points_per_edge)
-    y_bottom = (h - 1.0) - _extract_edge_offsets(is_bg_tb, tb_depth, "bottom", points_per_edge)
-    x_left = _extract_edge_offsets(is_bg, lr_depth, "left", points_per_edge)
-    x_right = (w - 1.0) - _extract_edge_offsets(is_bg, lr_depth, "right", points_per_edge)
+    top_bg = _compute_strip_bg_mask(image[:tb_depth, :], l_paper, a_paper, b_paper, include_dark_tb=True)
+    bot_bg = _compute_strip_bg_mask(image[h - tb_depth :, :], l_paper, a_paper, b_paper, include_dark_tb=True)
+    left_bg = _compute_strip_bg_mask(image[:, :lr_depth], l_paper, a_paper, b_paper, include_dark_tb=False)
+    right_bg = _compute_strip_bg_mask(image[:, w - lr_depth :], l_paper, a_paper, b_paper, include_dark_tb=False)
+
+    y_top = _extract_strip_edge_offsets(top_bg, "top", points_per_edge, h)
+    y_bottom = (h - 1.0) - _extract_strip_edge_offsets(bot_bg, "bottom", points_per_edge, h)
+    x_left = _extract_strip_edge_offsets(left_bg, "left", points_per_edge, h)
+    x_right = (w - 1.0) - _extract_strip_edge_offsets(right_bg, "right", points_per_edge, h)
+
+    has_outside = bool(
+        np.any(y_top > 0) or np.any(y_bottom < h - 1.0) or np.any(x_left > 0) or np.any(x_right < w - 1.0)
+    )
+    if not has_outside:
+        return _clean_residual_border_bleed(image, a_paper=a_paper, b_paper=b_paper, paper_bgr=paper_bgr)
 
     out = image.copy()
     ys = np.arange(h, dtype=np.float32)[:, None]
@@ -641,22 +655,23 @@ def multipoint_border_mask_clean(image: np.ndarray, points_per_edge: int = 32) -
     )
     # Propagate adjacent interior paper intensity into outside_mask at low resolution for speed
     if np.any(outside_mask):
-        invalid_mask = (outside_mask | (is_bg_tb > 0)).astype(np.uint8)
         scale = min(1.0, 500.0 / max(h, w))
         if scale < 0.99:
             sw = max(1, int(round(w * scale)))
             sh = max(1, int(round(h * scale)))
             small_seed = cv2.resize(image, (sw, sh), interpolation=cv2.INTER_AREA)
-            small_invalid = cv2.resize(invalid_mask, (sw, sh), interpolation=cv2.INTER_NEAREST) > 0
-            small_seed[small_invalid] = 0
+            small_bg = _compute_strip_bg_mask(small_seed, l_paper, a_paper, b_paper, include_dark_tb=True) > 0
+            small_out = cv2.resize(outside_mask.astype(np.uint8), (sw, sh), interpolation=cv2.INTER_NEAREST) > 0
+            small_seed[small_out | small_bg] = 0
             k_dil = max(5, int(round(31 * scale)) | 1)
             k_med = max(3, int(round(21 * scale)) | 1)
             dil_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_dil, k_dil))
-            small_bg = cv2.medianBlur(cv2.dilate(small_seed, dil_kernel, iterations=2), k_med)
-            local_bg = cv2.resize(small_bg, (w, h), interpolation=cv2.INTER_LINEAR)
+            small_fill = cv2.medianBlur(cv2.dilate(small_seed, dil_kernel, iterations=2), k_med)
+            local_bg = cv2.resize(small_fill, (w, h), interpolation=cv2.INTER_LINEAR)
         else:
+            full_bg = _compute_strip_bg_mask(image, l_paper, a_paper, b_paper, include_dark_tb=True) > 0
             seed = image.copy()
-            seed[invalid_mask > 0] = 0
+            seed[outside_mask | full_bg] = 0
             local_bg = cv2.medianBlur(cv2.dilate(seed, _KERNEL_31x31, iterations=2), 21)
         out[outside_mask] = local_bg[outside_mask]
 
@@ -843,9 +858,40 @@ def flatten_document_surface(
     if h < 120 or w < 120:
         return image
 
-    _, _, _, _, _, paper_bgr = _estimate_paper_stats(image, need_hsv=False)
+    paper_bgr_cache: list[int] | None = None
+
+    def _paper_bgr_list() -> list[int]:
+        nonlocal paper_bgr_cache
+        if paper_bgr_cache is None:
+            paper_bgr_cache = _estimate_paper_scalars(image)[3].tolist()
+        return paper_bgr_cache
+
     work_img = image
     gray = cv2.cvtColor(work_img, cv2.COLOR_BGR2GRAY)
+
+    # Fast pre-check at <=900px so already-flat pages skip full-resolution morphology
+    if max(h, w) > 1000:
+        scale = 900.0 / max(h, w)
+        sw = max(120, int(round(w * scale)))
+        sh = max(120, int(round(h * scale)))
+        gray_sm = cv2.resize(gray, (sw, sh), interpolation=cv2.INTER_AREA)
+        h_l_sm, xs_h_sm, ys_h_sm, dy_h_sm, _, xs_v_sm, _, dx_v_sm = _detect_surface_lines(gray_sm)
+        skew_pre = _estimate_skew_angle_deg(h_l_sm, sw)
+        if abs(skew_pre) < 0.25 or abs(skew_pre) > 8.5:
+            if xs_h_sm.size < 20 and xs_v_sm.size < 20:
+                logger.info("Flatten skipped (insufficient line samples)")
+                return work_img
+            if xs_h_sm.size >= 20:
+                if (len(h_l_sm) < 2 or float(ys_h_sm.max() - ys_h_sm.min()) < 0.14 * sh) and xs_v_sm.size < 20:
+                    logger.info("Flatten skipped (sparse vertical coverage)")
+                    return work_img
+                rms_est = float(np.sqrt(np.mean(dy_h_sm**2))) * (h / float(sh))
+            else:
+                rms_est = float(np.sqrt(np.mean(dx_v_sm**2))) * (w / float(sw))
+            if rms_est < 1.1:
+                logger.info("Flatten skipped (already flat: rms_before=%.2f px)", rms_est)
+                return work_img
+
     h_lines, xs_h, ys_h, dy_h, v_lines, xs_v, ys_v, dx_v = _detect_surface_lines(gray)
 
     skew_deg = _estimate_skew_angle_deg(h_lines, w)
@@ -857,7 +903,7 @@ def flatten_document_surface(
             (w, h),
             flags=cv2.INTER_CUBIC,
             borderMode=cv2.BORDER_CONSTANT,
-            borderValue=paper_bgr.tolist(),
+            borderValue=_paper_bgr_list(),
         )
         logger.info("Deskewed page by %.2f deg", skew_deg)
         gray = cv2.cvtColor(work_img, cv2.COLOR_BGR2GRAY)
@@ -912,8 +958,9 @@ def flatten_document_surface(
 
     logger.info("Flatten applied (rms %.2f -> %.2f px)", rms_before, rms_after)
     pad = int(0.065 * min(h, w)) + 8
+    fill_val = _paper_bgr_list()
     padded = cv2.copyMakeBorder(
-        work_img, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=paper_bgr.tolist()
+        work_img, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=fill_val
     )
     dx_pad = cv2.copyMakeBorder(delta_x, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
     dy_pad = cv2.copyMakeBorder(delta_y, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
@@ -925,7 +972,7 @@ def flatten_document_surface(
         grid_y.astype(np.float32),
         interpolation=cv2.INTER_CUBIC,
         borderMode=cv2.BORDER_CONSTANT,
-        borderValue=paper_bgr.tolist(),
+        borderValue=fill_val,
     )
 
 
@@ -947,8 +994,12 @@ def balance_page_symmetry(
     if th < 120 or tw < 120:
         return _center_crop_to_shape(image, th, tw)
 
-    lab, _, l_paper, _, _, paper_bgr = _estimate_paper_stats(image, need_hsv=False)
-    content_raw = (lab[:, :, 0].astype(np.float32) < (l_paper - 28.0)).astype(np.uint8) * 255
+    l_paper, _, _, paper_bgr = _estimate_paper_scalars(image)
+    lab_L = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)[:, :, 0]
+    thresh_val = int(np.ceil(l_paper - 28.0)) - 1
+    if thresh_val < 0:
+        return _center_crop_to_shape(image, th, tw)
+    _, content_raw = cv2.threshold(lab_L, min(255, thresh_val), 255, cv2.THRESH_BINARY_INV)
     content_clean = cv2.morphologyEx(content_raw, cv2.MORPH_OPEN, _KERNEL_2x2)
     num_lbl, _, stats, _ = cv2.connectedComponentsWithStats(content_clean, connectivity=8)
     if num_lbl <= 1:
@@ -1009,9 +1060,10 @@ def compensate_strokes_and_lines(normalized: np.ndarray) -> np.ndarray:
     """Repair 1-4px breaks in ruling borders using local ink intensity and adaptive thresholds."""
     h, w = normalized.shape[:2]
     norm_gray = cv2.cvtColor(normalized, cv2.COLOR_BGR2GRAY)
-    p85 = float(np.percentile(norm_gray, 85))
+    step = max(1, max(h, w) // 500)
+    p85 = float(np.percentile(norm_gray[::step, ::step], 85))
     ink_thresh = int(np.clip(p85 - 45.0, 140.0, 220.0))
-    line_mask = (norm_gray < ink_thresh).astype(np.uint8) * 255
+    _, line_mask = cv2.threshold(norm_gray, ink_thresh - 1, 255, cv2.THRESH_BINARY_INV)
 
     min_dim = min(h, w)
     open_len = max(15, int(round(35.0 * min_dim / 1650.0)) | 1)
@@ -1027,20 +1079,21 @@ def compensate_strokes_and_lines(normalized: np.ndarray) -> np.ndarray:
     v_close = cv2.morphologyEx(v_open, cv2.MORPH_CLOSE, k_v_close)
 
     out = normalized.copy()
-    h_gap = (h_close > 0) & (line_mask == 0)
-    if np.any(h_gap):
+    not_line = cv2.bitwise_not(line_mask)
+    h_gap = cv2.bitwise_and(h_close, not_line)
+    if cv2.countNonZero(h_gap):
         h_ink = cv2.erode(normalized, cv2.getStructuringElement(cv2.MORPH_RECT, (close_len, 3)))
-        out[h_gap] = h_ink[h_gap]
+        cv2.copyTo(h_ink, h_gap, out)
 
-    v_gap = (v_close > 0) & (line_mask == 0)
-    if np.any(v_gap):
+    v_gap = cv2.bitwise_and(v_close, not_line)
+    if cv2.countNonZero(v_gap):
         v_ink = cv2.erode(normalized, cv2.getStructuringElement(cv2.MORPH_RECT, (3, close_len)))
-        out[v_gap] = v_ink[v_gap]
+        cv2.copyTo(v_ink, v_gap, out)
 
-    grid_mask = (h_open > 0) | (v_open > 0) | h_gap | v_gap
-    if np.any(grid_mask):
+    grid_mask = cv2.bitwise_or(cv2.bitwise_or(h_open, v_open), cv2.bitwise_or(h_gap, v_gap))
+    if cv2.countNonZero(grid_mask):
         boosted = cv2.LUT(out, _LINE_BOOST_LUT)
-        out[grid_mask] = boosted[grid_mask]
+        cv2.copyTo(boosted, grid_mask, out)
     return out
 
 
@@ -1051,10 +1104,9 @@ def _estimate_global_wb_gain(img: np.ndarray) -> np.ndarray:
     x0, x1 = int(w * 0.08), int(w * 0.92)
     roi = img[y0:y1, x0:x1] if (y1 - y0 >= 24 and x1 - x0 >= 24) else img
     rh, rw = roi.shape[:2]
-    max_dim = max(rh, rw)
-    if max_dim > 400:
-        scale = 400.0 / max_dim
-        roi = cv2.resize(roi, (max(1, int(rw * scale)), max(1, int(rh * scale))), interpolation=cv2.INTER_AREA)
+    step = max(1, max(rh, rw) // 400)
+    if step > 1:
+        roi = roi[::step, ::step]
 
     flat = roi.reshape(-1, 3).astype(np.float32)
     luma = 0.114 * flat[:, 0] + 0.587 * flat[:, 1] + 0.299 * flat[:, 2]
@@ -1122,6 +1174,15 @@ def _compute_background_ratio(gray: np.ndarray, paper_luma: float | None = None)
     return ratio_small
 
 
+def _scale_by_ratio_u8(img: np.ndarray, ratio: np.ndarray) -> np.ndarray:
+    """Multiply uint8 image (1-ch gray or 3-ch BGR) by float32 ratio field safely."""
+    scale_arr = cv2.merge((ratio, ratio, ratio)) if img.ndim == 3 else ratio
+    try:
+        return cv2.multiply(img, scale_arr, dtype=cv2.CV_8U)
+    except cv2.error:
+        return cv2.multiply(img.astype(np.float32), scale_arr, dtype=cv2.CV_8U)
+
+
 def enhance_image_bgr(img: np.ndarray, mode: str = "auto_color") -> np.ndarray:
     """Enhance a BGR OpenCV image in-place pipeline and return a BGR ndarray."""
     mode = normalize_enhance_mode(mode)
@@ -1141,10 +1202,7 @@ def enhance_image_bgr(img: np.ndarray, mode: str = "auto_color") -> np.ndarray:
         wb_img = _apply_wb_gain(img, _estimate_global_wb_gain(img))
         gray = cv2.cvtColor(wb_img, cv2.COLOR_BGR2GRAY)
         ratio = _compute_background_ratio(gray)
-        b, g, r = cv2.split(wb_img.astype(np.float32))
-        normalized = cv2.merge(
-            [np.clip(b * ratio, 0, 255), np.clip(g * ratio, 0, 255), np.clip(r * ratio, 0, 255)]
-        ).astype(np.uint8)
+        normalized = _scale_by_ratio_u8(wb_img, ratio)
         compensated = compensate_strokes_and_lines(normalized)
         lut_applied = cv2.LUT(compensated, _MAGIC_LUT)
         return cv2.filter2D(lut_applied, -1, _SHARPEN_KERNEL)
@@ -1161,7 +1219,7 @@ def enhance_image_bgr(img: np.ndarray, mode: str = "auto_color") -> np.ndarray:
 
     if mode == "grayscale":
         ratio = _compute_background_ratio(gray)
-        norm_gray = np.clip(gray.astype(np.float32) * ratio, 0, 255).astype(np.uint8)
+        norm_gray = _scale_by_ratio_u8(gray, ratio)
         clean_gray = cv2.LUT(norm_gray, _MAGIC_LUT)
         return cv2.cvtColor(clean_gray, cv2.COLOR_GRAY2BGR)
 
@@ -1707,6 +1765,33 @@ def _process_single_page_task(task: dict, config: dict) -> dict:
     }
 
 
+def _parse_workers_arg(value: str) -> int:
+    """Parse --workers value ('auto', 0, or positive integer >= 1) into int (0 means auto)."""
+    token = str(value).strip().lower()
+    if token == "auto":
+        return 0
+    try:
+        parsed = int(token)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Invalid --workers value: {value!r} (use 'auto' or >= 0)") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"Invalid --workers value: {value!r} (must be >= 0 or 'auto')")
+    return parsed
+
+
+def resolve_worker_count(requested_workers: int, task_count: int, sample_pixels: int = 0) -> int:
+    """Resolve effective worker count; auto (<= 0) avoids multiprocessing spawn overhead on small/low-res batches."""
+    if task_count <= 1:
+        return 1
+    if requested_workers > 0:
+        return max(1, min(requested_workers, task_count))
+    if task_count <= 8:
+        return 1
+    if 0 < sample_pixels < 1_500_000 and task_count < 16:
+        return 1
+    return min(4, max(1, (os.cpu_count() or 2) // 2), task_count)
+
+
 def convert_folder_to_hd_pdf(
     input_path: str,
     output_pdf_path: str | None = None,
@@ -1724,12 +1809,15 @@ def convert_folder_to_hd_pdf(
     manifest_path: str | None = None,
     min_confidence: float = 0.45,
     jpeg_quality: int = 86,
-    workers: int = 1,
+    workers: int | str = 1,
 ) -> bool:
     """Scan a folder/image/PDF in streaming mode and export processed pages/manifest and/or an HD PDF."""
     canon_mode = normalize_enhance_mode(mode)
     jpeg_quality = max(1, min(100, int(jpeg_quality)))
-    workers = max(1, int(workers))
+    if isinstance(workers, str) and workers.strip().lower() == "auto":
+        requested_workers = 0
+    else:
+        requested_workers = max(0, int(workers))
     manifest_file = Path(manifest_path).expanduser() if manifest_path else None
 
     if not os.path.exists(input_path):
@@ -1779,7 +1867,7 @@ def convert_folder_to_hd_pdf(
         debug_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(
-        "Processing %d file(s) from: %s [mode=%s, crop_engine=%s, multipoint=%d, flatten=%s, symmetry=%s, dpi=%d, q=%d, workers=%d]",
+        "Processing %d file(s) from: %s [mode=%s, crop_engine=%s, multipoint=%d, flatten=%s, symmetry=%s, dpi=%d, q=%d, workers=%s]",
         len(files),
         input_path,
         canon_mode,
@@ -1789,12 +1877,28 @@ def convert_folder_to_hd_pdf(
         balance_symmetry,
         dpi,
         jpeg_quality,
-        workers,
+        "auto" if requested_workers <= 0 else requested_workers,
     )
 
     with tempfile.TemporaryDirectory(prefix="pdfscanner_") as tmp:
         tmp_dir = Path(tmp)
         tasks = _discover_page_tasks(files, use_vision=use_vision, tmp_dir=tmp_dir)
+
+        sample_pixels = 0
+        if requested_workers <= 0:
+            for t in tasks:
+                lp = t.get("load_path")
+                if t.get("error") is None and lp:
+                    try:
+                        with Image.open(lp) as im_hdr:
+                            sw_px, sh_px = im_hdr.size
+                        sample_pixels = int(sw_px) * int(sh_px)
+                        break
+                    except Exception:
+                        pass
+        effective_workers = resolve_worker_count(requested_workers, len(tasks), sample_pixels=sample_pixels)
+        if requested_workers <= 0:
+            logger.info("Auto-selected %d worker(s) for %d page(s)", effective_workers, len(tasks))
 
         if use_vision:
             vision_inputs = [t["vision_input"] for t in tasks if t["error"] is None and t["vision_input"]]
@@ -1823,10 +1927,10 @@ def convert_folder_to_hd_pdf(
         }
 
         ordered_results: list[dict | None] = [None] * len(tasks)
-        if workers > 1 and len(tasks) > 1:
+        if effective_workers > 1 and len(tasks) > 1:
             mp_ctx = multiprocessing.get_context("spawn")
             with ProcessPoolExecutor(
-                max_workers=min(workers, len(tasks)),
+                max_workers=min(effective_workers, len(tasks)),
                 mp_context=mp_ctx,
                 initializer=_init_worker,
             ) as executor:
@@ -1974,9 +2078,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--workers",
-        type=int,
+        type=_parse_workers_arg,
         default=1,
-        help="Number of worker processes for page enhancement (default: 1, streaming)",
+        help="Number of worker processes for page enhancement ('auto', 0, or N; default: 1)",
     )
     parser.add_argument(
         "--min-confidence",

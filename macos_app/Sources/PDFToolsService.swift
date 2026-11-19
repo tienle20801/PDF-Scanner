@@ -326,6 +326,59 @@ enum PDFToolsService {
         return chosen.isEmpty ? ["en-US"] : chosen
     }()
 
+    private final class VisionWarmUpState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var started = false
+
+        func markStartedIfNeeded() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !started else { return false }
+            started = true
+            return true
+        }
+    }
+
+    private static let visionWarmUpState = VisionWarmUpState()
+
+    /// Performs a one-time non-blocking Vision `.accurate` OCR pass at app launch so ANE/MIL compilation
+    /// happens in the background rather than stalling the user's first document scan.
+    static func warmUpVisionOCR() {
+        guard ProcessInfo.processInfo.environment["PDF_SCANNER_DISABLE_WARMUP"] != "1" else { return }
+        guard visionWarmUpState.markStartedIfNeeded() else { return }
+
+        DispatchQueue.global(qos: .utility).async {
+            let cs = CGColorSpaceCreateDeviceRGB()
+            guard let ctx = CGContext(
+                data: nil,
+                width: 128,
+                height: 64,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: cs,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return }
+            ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+            ctx.fill(CGRect(x: 0, y: 0, width: 128, height: 64))
+            let font = CTFontCreateWithName("Helvetica" as CFString, 18, nil)
+            let attr = [
+                kCTFontAttributeName: font,
+                kCTForegroundColorAttributeName: CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+            ] as CFDictionary
+            if let attrStr = CFAttributedStringCreate(nil, "ABC 123" as CFString, attr) {
+                let line = CTLineCreateWithAttributedString(attrStr)
+                ctx.textPosition = CGPoint(x: 8, y: 24)
+                CTLineDraw(line, ctx)
+            }
+            guard let cg = ctx.makeImage() else { return }
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            request.usesLanguageCorrection = true
+            request.recognitionLanguages = resolvedOCRLanguages
+            try? VNImageRequestHandler(cgImage: cg, options: [:]).perform([request])
+        }
+    }
+
     static func ocrCacheKey(for url: URL, pageIndex: Int? = nil, rotationDegrees: Int = 0) -> String {
         let deg = ((rotationDegrees % 360) + 360) % 360
         let mtimeMs = fileModificationTimestamp(for: url)

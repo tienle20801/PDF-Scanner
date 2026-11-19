@@ -1345,6 +1345,66 @@ ctx.closePDF()
             self.assertEqual(im_nocrop.mode, "1")
             self.assertEqual(im_crop.mode, "1")
 
+    def test_speed_opt_highres_flatten_symmetry_and_auto_workers(self):
+        # 1. High-res (2057x1542) flat page -> fast pre-check skips cleanly (exact pixels preserved)
+        flat = np.full((1542, 2057, 3), (252, 252, 252), dtype=np.uint8)
+        for y in range(180, 1380, 110):
+            cv2.line(flat, (160, y), (1890, y), (30, 30, 30), 2)
+        self.assertTrue(np.array_equal(flat, batch_scanner.flatten_document_surface(flat)))
+
+        # 2. High-res (2057x1542) curved + 2 deg skewed table -> pre-check enters full flatten and fixes curl
+        curved = np.full((1542, 2057, 3), (252, 252, 252), dtype=np.uint8)
+        xs = np.arange(160, 1890)
+        for y0 in range(180, 1380, 110):
+            ys = y0 + np.round(24.0 * np.sin(np.pi * (xs - 160) / 1730.0) + 0.035 * (xs - 1028)).astype(int)
+            pts = np.stack([xs, ys], axis=1).reshape(-1, 1, 2)
+            cv2.polylines(curved, [pts], False, (30, 30, 30), 2)
+        rectified = batch_scanner.flatten_document_surface(curved)
+        _, _, _, dy_after, *_ = batch_scanner._detect_surface_lines(cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY))
+        self.assertLess(float(np.sqrt(np.mean(dy_after**2))), 1.5)
+
+        # 3. High-res (2057x1542) shifted block + 3x3 dust speck -> downscaled balance_page_symmetry centers main content
+        asym = np.full((1542, 2057, 3), (250, 250, 250), dtype=np.uint8)
+        cv2.rectangle(asym, (140, 120), (1080, 920), (30, 30, 30), 4)
+        for ry in range(180, 880, 60):
+            cv2.line(asym, (180, ry), (1040, ry), (25, 25, 25), 4)
+        asym[1515:1518, 2030:2033] = (15, 15, 15)
+        centered = batch_scanner.balance_page_symmetry(asym)
+        xs_c = np.where(cv2.cvtColor(centered, cv2.COLOR_BGR2GRAY) < 200)[1]
+        self.assertLess(abs(int(xs_c.min()) - (2057 - int(xs_c.max()))), 25)
+
+        # 4. High-res strip-only multipoint_border_mask_clean removes dark outer border without touching interior ink
+        dirty = flat.copy()
+        dirty[:30, :] = (40, 48, 60)
+        dirty[-25:, :] = (40, 48, 60)
+        dirty[:, :20] = (40, 48, 60)
+        cleaned = batch_scanner.multipoint_border_mask_clean(dirty, points_per_edge=32)
+        self.assertGreater(float(cleaned[8, 500].mean()), 180.0)
+        self.assertGreater(float(cleaned[1530, 500].mean()), 180.0)
+        self.assertGreater(float(cleaned[500, 8].mean()), 180.0)
+        self.assertLess(float(cleaned[180, 500].mean()), 80.0)
+
+        # 5. resolve_worker_count matrix & CLI --workers auto end-to-end smoke
+        self.assertEqual(batch_scanner.resolve_worker_count(1, 10, sample_pixels=12_000_000), 1)
+        self.assertEqual(batch_scanner.resolve_worker_count(4, 6, sample_pixels=12_000_000), 4)
+        self.assertEqual(batch_scanner.resolve_worker_count(0, 6, sample_pixels=12_000_000), 1)
+        self.assertEqual(batch_scanner.resolve_worker_count(0, 12, sample_pixels=500 * 500), 1)
+        resolved_big = batch_scanner.resolve_worker_count(0, 12, sample_pixels=4032 * 3024)
+        expected_big = min(4, max(1, (os.cpu_count() or 2) // 2))
+        self.assertEqual(resolved_big, expected_big)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            in_dir = d / "in"
+            in_dir.mkdir()
+            doc = _make_doc_image(800, 1000, with_border=True)
+            cv2.imwrite(str(in_dir / "p1.jpg"), doc)
+            cv2.imwrite(str(in_dir / "p2.jpg"), doc)
+            out_pdf = d / "auto_w.pdf"
+            p = _run_cli([str(in_dir), str(out_pdf), "--crop-engine", "opencv", "--workers", "auto"])
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(len(PdfReader(str(out_pdf)).pages), 2)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

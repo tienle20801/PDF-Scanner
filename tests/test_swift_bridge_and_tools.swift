@@ -608,6 +608,49 @@ struct SwiftPhase1Tests {
         let resolvedP18 = p18Res.resolvedURLs[staleItem.id]!
         assertTrue(resolvedP18.path != cleanPrev.path, "P1-18 nil processedCacheKey must NOT reuse stale preview")
 
+        final class LineCollector: @unchecked Sendable {
+            private let lock = NSLock()
+            private var lines: [String] = []
+            func append(_ line: String) {
+                lock.lock()
+                lines.append(line)
+                lock.unlock()
+            }
+            func snapshot() -> [String] {
+                lock.lock()
+                defer { lock.unlock() }
+                return lines
+            }
+        }
+
+        // Step 3 Speed Optimization regressions: warmUpVisionOCR idempotency + --workers auto only on hybridOpenCV
+        PDFToolsService.warmUpVisionOCR()
+        PDFToolsService.warmUpVisionOCR()
+
+        let execLogBox = LineCollector()
+        var autoWorkerSettings = ScanSettings()
+        autoWorkerSettings.engine = .hybridOpenCV
+        autoWorkerSettings.mode = .clean
+        autoWorkerSettings.autoCrop = false
+        let autoWorkersPDF = tmpRoot.appendingPathComponent("auto_workers_hybrid.pdf")
+        let autoRes = try await bridge.runBatchScan(items: [cleanItem], settings: autoWorkerSettings, outputPDF: autoWorkersPDF) { line in
+            execLogBox.append(line)
+        }
+        assertTrue(autoRes.resolvedURLs[cleanItem.id] != nil, "Hybrid runBatchScan with --workers auto succeeds")
+        let hybridExecLines = execLogBox.snapshot().filter { $0.hasPrefix("[Exec]") }
+        assertTrue(hybridExecLines.contains(where: { $0.contains("--workers auto") }), "Hybrid pipeline must pass --workers auto")
+
+        let pureLogBox = LineCollector()
+        var pureCheckSettings = ScanSettings()
+        pureCheckSettings.engine = .pureSwiftVision
+        pureCheckSettings.autoCrop = false
+        let pureWorkersPDF = tmpRoot.appendingPathComponent("pure_no_workers_flag.pdf")
+        _ = try await bridge.runBatchScan(items: [cleanItem], settings: pureCheckSettings, outputPDF: pureWorkersPDF) { line in
+            pureLogBox.append(line)
+        }
+        let pureExecLines = pureLogBox.snapshot().filter { $0.hasPrefix("[Exec]") }
+        assertTrue(!pureExecLines.contains(where: { $0.contains("--workers") }), "Pure Swift Vision must NOT receive --workers")
+
         // 11h. Mock-root ScannerBridge tests: P0-2 deadlock, P1-15 pre-cancel, P1-13 UTF-8 pipe, P1-14 preflight >256KB, P1-7 SIGTERM cancel, P2 python3.* glob
         defer { setenv("PDF_SCANNER_ROOT", repoRoot.path, 1) }
 
@@ -722,20 +765,6 @@ struct SwiftPhase1Tests {
         assertTrue(pf.isHealthy, "P1-14 preflight with 280 KiB stderr must succeed cleanly (got: \(pf.summary))")
         assertTrue(Date().timeIntervalSince(tPreflight) < 5.0, "P1-14 preflight must not deadlock on >256KB stderr")
 
-        final class LineCollector: @unchecked Sendable {
-            private let lock = NSLock()
-            private var lines: [String] = []
-            func append(_ line: String) {
-                lock.lock()
-                lines.append(line)
-                lock.unlock()
-            }
-            func snapshot() -> [String] {
-                lock.lock()
-                defer { lock.unlock() }
-                return lines
-            }
-        }
         let collector = LineCollector()
         let utf8InPDF = tmpRoot.appendingPathComponent("utf8_stress_in.pdf")
         let utf8OutPDF = tmpRoot.appendingPathComponent("utf8_stress_out.pdf")

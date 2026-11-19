@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.2.0 — Performance Optimization, Auto-Workers & Vision Warm-Up (2026-11-19)
+
+### Changes & Measured Results
+- **Benchmark Methodology Fix ([scripts/benchmark.py](scripts/benchmark.py)):**
+  - Reported both `median` and `min` latencies alongside `LoadAvg` in `bench_single_image`.
+  - Isolated `bench_batch` via `/usr/bin/time -l` CLI subprocess execution so reported Peak RSS (`434.5 MiB`) reflects true CLI memory rather than inherited single-page 12MP benchmark buffers (`1022.8 MiB` in earlier `RUSAGE_SELF` runs). Added `--workers` string support (`auto` / `N`) and `--in-process` opt-in.
+- **Python Imaging Hot-Path Speedups ([scripts/batch_scanner.py](scripts/batch_scanner.py)):**
+  - Replaced full-frame LAB/HSV scans in `multipoint_border_mask_clean`, `flatten_document_surface`, and `balance_page_symmetry` with strided `_estimate_paper_scalars`, strip-only `_compute_strip_bg_mask` / `_extract_strip_edge_offsets`, lazy `paper_bgr` evaluation, and a `900 px` low-res flat/sparse pre-check in `flatten_document_surface`.
+  - Replaced `cv2.split`/`np.clip`/`cv2.merge` float32 loops and NumPy boolean masks with `_scale_by_ratio_u8` (`cv2.multiply`), strided WB/p85 estimation, `cv2.threshold`, and `cv2.copyTo`.
+  - **PSNR Parity vs Unoptimized Baseline:** `multipoint_clean` **`361.20 dB`** (`exact=True`), `multipoint_dirty` **`361.20 dB`** (`exact=True`), `flatten_curved` **`361.20 dB`** (`exact=True`), `enhance_auto` **`50.73 dB`**, `enhance_gray` **`60.30 dB`**, `symmetry` **`52.72 dB`**.
+  - **Measured Latency (`Apple Silicon arm64`, `Darwin 27.2.0`, 5 runs):**
+    - `Total 6-stage (A4@200)`: **`621.2 / 558.2 ms` → `264.1 / 215.7 ms`** (`med / min`; `multipoint` `119.6 → 25.0 ms`, `enhance` `167.3 → 53.8 ms`, `flatten` `126.9 → 68.1 ms`, `symmetry` `133.1 → 42.3 ms`).
+    - `enhance_image_bgr (full 12MP)`: **`1033.1 / 774.4 ms` → `185.2 / 149.7 ms`**.
+    - `10-Page 12MP Batch (workers=1)`: **`7.54 s` → `2.65 s` (`0.27 s/page`)**, Isolated CLI Peak RSS **`434.5 MiB`**.
+- **Adaptive Multiprocessing & Vision Warm-Up ([scripts/batch_scanner.py](scripts/batch_scanner.py), [ScannerBridge.swift](macos_app/Sources/ScannerBridge.swift), [PDFToolsService.swift](macos_app/Sources/PDFToolsService.swift), [AppViewModel.swift](macos_app/Sources/AppViewModel.swift)):**
+  - Added `resolve_worker_count` and `--workers auto` (`1` worker for `<= 8` pages or `< 1.5 MP` small batches to avoid spawn overhead; up to `4` workers otherwise), passed for `.hybridOpenCV` batches only (`3.70 s` for 10 12MP pages at `--workers auto`, Isolated CLI Peak RSS `424.3 MiB`).
+  - Added idempotent non-blocking `PDFToolsService.warmUpVisionOCR()` invoked at `AppViewModel.init()` (skips if `PDF_SCANNER_DISABLE_WARMUP=1`).
+- **Verification:** `./tests/run_all.sh` (**23/23 Python tests OK in `33.254s`** + Swift integration/regression suite **PASS**), `swiftc -O -strict-concurrency=complete` (**0 errors, 0 warnings**), and `./macos_app/build_app.sh` (`PDF Scanner.app`, `206M`, `codesign --verify --deep --strict` valid).
+
 ## v1.1.1 — Concurrency, Bridge I/O, Unicode NFC & Compression Hardening (2026-11-18)
 
 ### Changes & Measured Results

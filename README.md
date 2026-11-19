@@ -87,7 +87,7 @@ Available CLI options (`python scripts/batch_scanner.py --help`):
 - `--min-confidence <0.0..1.0>` (default: `0.45`, Vision crop confidence threshold)
 - `--multipoint-points <int>` (default: `32` = `128` edge control points; `0` to disable)
 - `--page-size a4|letter|fit` (default: `a4`), `--dpi <int>` (default: `200`, downscales large pages only; `>= 72`), `--margin <pts>` (default: `20.0`), `--jpeg-quality <1..100>` (default: `86`)
-- `--workers <int>` (default: `1`, page-level streaming; set `>1` for multiprocessing), `--no-crop`, `--no-flatten`, `--symmetry` / `--no-symmetry` (symmetry off by default), `--worker-stdio`, `--emit-dir <dir>`, `--manifest <file.json>`, `--save-debug <dir>`
+- `--workers <int|auto>` (default: `1`, page-level streaming; `'auto'`/`0` selects `1` for small/low-res batches or up to `4` processes for larger high-res batches; `>1` forces multiprocessing), `--no-crop`, `--no-flatten`, `--symmetry` / `--no-symmetry` (symmetry off by default), `--worker-stdio`, `--emit-dir <dir>`, `--manifest <file.json>`, `--save-debug <dir>`
 
 Independent vector-preserving PDF compression CLI ([scripts/pdf_compressor.py](scripts/pdf_compressor.py)):
 ```bash
@@ -97,7 +97,7 @@ This keeps pure vector/text pages and original page `MediaBox` sizes untouched w
 
 Color and `grayscale` pages are JPEG-encoded once at the end (`quality=86` default in Python CLI, `88` in `doc_scanner.swift`) and embedded as `/DCTDecode` (`/DeviceRGB` or `/DeviceGray`); `bw` pages in Python CLI are stored as 1-bit PNGs and embedded as 1-bit `/FlateDecode` (`/DeviceGray`) inside exact `A4`, `Letter`, or `Fit` `MediaBox` PDFs.
 
-*Streaming & Worker execution:* `convert_folder_to_hd_pdf` processes pages in streaming mode (`workers=1`) or isolated per-page subprocesses (`--workers N`), keeping isolated 10-page 12MP CLI Peak RSS around `1022.8 MiB` (`0.55 s/page`). Live UI previews reuse a single warm `--worker-stdio` Python process to avoid repeated OpenCV import latency.
+*Streaming & Worker execution:* `convert_folder_to_hd_pdf` processes pages in streaming mode (`workers=1`) or isolated per-page subprocesses (`--workers auto|<N>`), keeping isolated 10-page 12MP CLI Peak RSS at `434.5 MiB` (`2.65 s`, `0.27 s/page` at `--workers 1`; `--workers auto` avoids multiprocessing spawn overhead on small `<= 8`-page or `< 1.5 MP` batches). Live UI previews reuse a single warm `--worker-stdio` Python process to avoid repeated OpenCV import latency.
 
 ### 3. macOS Native Desktop App (`PDF Scanner.app`)
 
@@ -121,14 +121,15 @@ Key UI capabilities:
 
 Measured reproducibly with [scripts/benchmark.py](scripts/benchmark.py) on synthetic 12MP (`4032×3024`) documents:
 
-- **Hardware & Software:** Apple M1 (`arm64`, 8 cores, 8 GB RAM), `Darwin 27.2.0`, Python `3.10.22`, OpenCV `5.0.0`, NumPy `2.2.6`
-- **Command:** `.venv/bin/python scripts/benchmark.py --pages 10 --runs 3`
+- **Hardware & Software:** Apple M1 (`arm64`, 8 cores, 8 GB RAM), `Darwin 27.2.0`, Python `3.10.22`, OpenCV `5.0.0`, NumPy `2.2.6` (measured LoadAvg `8.53–9.61`, Peak RSS isolated via `/usr/bin/time -l`)
+- **Command:** `.venv/bin/python scripts/benchmark.py --pages 10 --runs 5 --workers 1`
 
-| Benchmark Workload | Measured Result | Notes |
+| Benchmark Workload | Median / Min Result | Notes |
 |---|---:|---|
-| **Single 12MP Page — 6-Stage Pipeline (`A4 @ 200 DPI`, OpenCV)** | **533.6 ms** (median) | `detect_and_crop` 16.7 ms, `downscale` 20.9 ms, `multipoint` 106.0 ms, `enhance` 119.2 ms, `flatten` 149.8 ms, `symmetry` 121.1 ms |
-| **Single 12MP Page — `enhance_image_bgr` on full 12MP** | **576.0 ms** (median) | Includes global paper WB + downsampled (`<= 720 px`) background estimation |
-| **10-Page 12MP Batch (`workers=1`, `A4 @ 200 DPI`, OpenCV)** | **5.50 s** (0.55 s/page) | Output PDF: `1.39 MiB` (`1,459,026 B`) • Peak RSS: `1022.8 MiB` |
+| **Single 12MP Page — 6-Stage Pipeline (`A4 @ 200 DPI`, OpenCV)** | **`264.1 ms` / `215.7 ms`** | `detect_and_crop` 27.5 / 16.9 ms, `downscale` 25.0 / 19.7 ms, `multipoint` 25.0 / 14.1 ms, `enhance` 53.8 / 45.0 ms, `flatten` 68.1 / 66.0 ms, `symmetry` 42.3 / 39.3 ms |
+| **Single 12MP Page — `enhance_image_bgr` on full 12MP** | **`185.2 ms` / `149.7 ms`** | Strided paper WB/scalars + SIMD `cv2.multiply` scaling & OpenCV stroke masking |
+| **10-Page 12MP Batch (`workers=1`, `A4 @ 200 DPI`, OpenCV)** | **`2.65 s` (`0.27 s/page`)** | Output PDF: `1.39 MiB` • Isolated CLI Peak RSS: **`434.5 MiB`** |
+| **10-Page 12MP Batch (`workers=auto`, `A4 @ 200 DPI`, OpenCV)** | **`3.70 s` (`0.37 s/page`)** | Uses 4 spawned workers (`>= 9` 12MP pages); `workers=4` explicit: `4.59 s`, parent RSS `371.9 MiB` |
 
 ---
 
@@ -173,7 +174,7 @@ Measured reproducibly with [scripts/benchmark.py](scripts/benchmark.py) on synth
 ## 🧪 Running Tests
 
 ```bash
-# Run full 22-case Python (unittest) & Swift (PDFToolsService, ScannerBridge, OCR, B5, A1/A2, P0/P1/P2) suite
+# Run full 23-case Python (unittest) & Swift (PDFToolsService, ScannerBridge, OCR, B5, A1/A2, P0/P1/P2, speed regressions) suite
 ./tests/run_all.sh
 ```
 

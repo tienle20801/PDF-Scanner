@@ -110,6 +110,7 @@ final class AppViewModel: ObservableObject {
             appendLog("[Init] Workspace: \(b.workspaceRoot.path)")
             appendLog("[Init] Python: \(b.pythonURL.path)")
             runPreflightAsync(using: b)
+            PDFToolsService.warmUpVisionOCR()
         } catch {
             self.errorMessage = error.localizedDescription
             appendLog("[ERROR] \(error.localizedDescription)")

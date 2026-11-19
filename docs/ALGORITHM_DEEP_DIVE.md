@@ -161,40 +161,43 @@ Under Land's Retinex / Lambertian model $I(x, y) = R(x, y) \cdot L(x, y)$:
 
 ## 4. Measured Benchmarks (Apple Silicon)
 
-All timings below are reproducibly measured using [scripts/benchmark.py](../scripts/benchmark.py) (`--pages 10 --runs 3`) on synthetic 12MP (`4032×3024` RGB) document captures:
+All timings below are reproducibly measured using [scripts/benchmark.py](../scripts/benchmark.py) (`--pages 10 --runs 5`, reporting `median / min` stage latencies and isolated CLI batch Peak RSS via `/usr/bin/time -l`) on synthetic 12MP (`4032×3024` RGB) document captures:
 
-- **Machine & OS:** Apple Silicon (`arm64`), `Darwin 27.2.0`
+- **Machine & OS:** Apple Silicon (`arm64`), `Darwin 27.2.0` (LoadAvg `8.53–9.61` AFTER vs `32.37–34.55` BEFORE)
 - **Runtime:** Python `3.10.22`, OpenCV `5.0.0`, NumPy `2.2.6`
 
-### 4.1 Per-Stage Latency (12MP Single Page, Median of 3 Runs)
+### 4.1 Per-Stage Latency (12MP Single Page, 5 Runs: `median / min`)
 
-| Pipeline Stage | Working Resolution | Median Latency (ms) |
-|---|---|---:|
-| `detect_and_crop` (OpenCV) | `4032×3024` (det. at `1000 px`) | `16.7 ms` |
-| `downscale_to_dpi` (`A4 @ 200 DPI`) | `4032×3024` → `~2200×1650` | `20.9 ms` |
-| `multipoint_border_mask_clean` (`32` pts/edge) | Scaled `A4 @ 200 DPI` | `106.0 ms` |
-| `enhance_image_bgr` (`auto_color`) | Scaled `A4 @ 200 DPI` | `119.2 ms` |
-| `flatten_document_surface` (quality-gated) | Scaled `A4 @ 200 DPI` | `149.8 ms` |
-| `balance_page_symmetry` | Scaled `A4 @ 200 DPI` | `121.1 ms` |
-| **Total 6-Stage Pipeline (`A4 @ 200 DPI`)** | **12MP → A4@200** | **`533.6 ms`** |
-| *Reference: `enhance_image_bgr` on unscaled 12MP* | *`4032×3024` (e.g. `--page-size fit`)* | *`576.0 ms`* |
+| Pipeline Stage | BEFORE (`med / min`) | AFTER (`med / min`) | Key Optimization |
+|---|---:|---:|---|
+| `detect_and_crop` (OpenCV) | `43.9 / 41.4 ms` | **`27.5 / 16.9 ms`** | Baseline `1000 px` quad detection |
+| `downscale_to_dpi` (`A4 @ 200 DPI`) | `25.4 / 23.1 ms` | **`25.0 / 19.7 ms`** | `INTER_AREA` downscale |
+| `multipoint_border_mask_clean` (`32` pts/edge) | `119.6 / 105.9 ms` | **`25.0 / 14.1 ms`** | Strided paper scalars + strip-only LAB/HSV & zero-copy interior path (`PSNR 361.20 dB`) |
+| `enhance_image_bgr` (`auto_color`, `A4@200`) | `167.3 / 121.9 ms` | **`53.8 / 45.0 ms`** | Strided WB ROI, `cv2.multiply` scaling, OpenCV threshold/bitwise stroke repair (`PSNR 50.73 dB`) |
+| `flatten_document_surface` (quality-gated) | `126.9 / 118.8 ms` | **`68.1 / 66.0 ms`** | Lazy paper fill + `900 px` pre-check before full-res line extraction (`PSNR 361.20 dB`) |
+| `balance_page_symmetry` | `133.1 / 103.8 ms` | **`42.3 / 39.3 ms`** | Strided paper scalars + OpenCV `THRESH_BINARY_INV` (`PSNR 52.72 dB` post-`enhance`) |
+| **Total 6-Stage Pipeline (`A4 @ 200 DPI`)** | **`621.2 / 558.2 ms`** | **`264.1 / 215.7 ms`** | **~2.4× median / ~2.6× min speedup** |
+| *Reference: `enhance_image_bgr` on full 12MP* | *`1033.1 / 774.4 ms`* | ***`185.2 / 149.7 ms`*** | **~5.6× speedup** for unscaled `--page-size fit` |
 
-### 4.2 End-to-End Streaming Batch Run (`A4 @ 200 DPI`, OpenCV)
+### 4.2 End-to-End Isolated CLI Batch Runs (`A4 @ 200 DPI`, OpenCV)
 
-| Batch Workload | Elapsed | Output PDF | Peak RSS |
-|---|---:|---:|---:|
-| **10-Page 12MP (`--workers 1`, `benchmark.py`)** | `5.50 s` (`0.55 s/page`) | `1.39 MiB` (`1,459,026 B`) | `1022.8 MiB` |
+| Batch Workload | BEFORE | AFTER | Output PDF | Isolated CLI Peak RSS |
+|---|---|---|---|---:|
+| **10-Page 12MP (`--workers 1`)** | `7.54 s` (`0.75 s/page`) | **`2.65 s` (`0.27 s/page`)** | `1.39 MiB` | **`434.5 MiB`** |
+| **10-Page 12MP (`--workers auto`)** | — | **`3.70 s` (`0.37 s/page`)** | `1.39 MiB` | **`424.3 MiB`** |
+| **10-Page 12MP (`--workers 4`)** | `6.88 s` (`0.69 s/page`) | **`4.59 s` (`0.46 s/page`)** | `1.39 MiB` | **`371.9 MiB`** *(parent)* |
 
 ---
 
 ## 5. Architecture & Remaining Research Directions
 
-### 5.1 Production Architecture Implemented (`v1.1.1`)
+### 5.1 Production Architecture Implemented (`v1.2.0`)
 - **Vector-Preserving PDF Compression ([scripts/pdf_compressor.py](../scripts/pdf_compressor.py), `B5` + `P1-20`):** Classifies pages via `/Font` and cumulative `/Image` pixel footprint (`>= 300k px`); accounts for `/Rotate`, `CTM` draw boxes, `/UserUnit`, and post-`detect_and_crop` aspect ratios when computing `eff_dpi`; stages an immutable source copy during compression (`source_pdf == output_pdf` safe); preserves pure text/vector pages and page `MediaBox` untouched; emits 1-bit `/FlateDecode` `/DeviceGray` for `mode="bw"` with size-bloat guard; and emits structured `--json-report` errors on encrypted/corrupt PDFs.
 - **Self-Contained Packaging, Preflight & Bridge (`A1`, `A2`, `P0-2`, `P1-13..18`):** `macos_app/build_app.sh` precompiles `scripts/doc_scanner.swift` into `Contents/Resources/bin/doc_scanner` (`swiftc -O`) and bundles relocatable `python_runtime` + `.venv` packages cleanly under strict ad-hoc `codesign`; `ScannerBridge` runs dependency preflight with concurrent pipe draining, discovers `python3.*` dynamically, maintains a `workerLock`-guarded `--worker-stdio` process (`NSLock` `defer` unlock safety, cancellation checks), decodes UTF-8 log streams across chunk boundaries (`LinePipeAccumulator`), rejects `nil` preview cache keys, isolates per-PID temp caches, and normalizes Unicode NFC manifest paths consistently with `batch_scanner.py` (`_canonical_path`) and `doc_scanner.swift`.
 - **Optional Vision OCR (`Q9`) & Single-Pass Corner-Vector Reading Orientation (`Q10`):** `PDFToolsService.detectReadingOrientationDegrees` builds downscaled `<= 1600 px` `CGImage` inputs directly (removing `tiffRepresentation` and global `NSLock` serialization), runs a single `.accurate` Vision OCR pass with supported `vi-VT` + `en-US` languages, and aggregates `conf^2 × alnumCount`-weighted quadrant votes from each observation's corner vector (`topRight - topLeft`, pixel-scaled with a positive `cross(u, v)` orthogonality check and dominance + margin gates over `0°`), eliminating `.fast` Vietnamese blind spots and `.accurate` internal auto-rotation ambiguity. Already-upright pages (`deg == 0`) populate the `OCRTextLine` cache reused during `compileProcessedImagesToPDF` (invisible CoreText text mode `.invisible`) when OCR is toggled on.
 - **Honest Pure Swift Engine (`Q8`):** Adds native CoreImage/DeviceGray `.grayscale` mode to `doc_scanner.swift` and surfaces actual CoreImage mode labels in UI while hiding Hybrid-only pipeline controls.
 - **Core Reliability, Security & SwiftUI Concurrency (`P0-1`, `P1-4..17`):** `batch_scanner.py` scales 16-bit grayscale (`I;16`/`I`) cleanly, composites `PA` / `*+tRNS` alpha over white, and writes manifests/PDFs atomically (`_atomic_write_bytes` via `NamedTemporaryFile`). `PDFToolsService` rejects password-protected `isLocked` PDFs, sanitizes `formatPairFileName` against path traversal and Vietnamese `\p{L}` word corruption, follows symlinks consistently on staging/cache hashing, and composites RGBA PNGs over white; `AppViewModel` uses UUID snapshots, epoch/generation guards, cancellation discrimination (`CancellationError` vs real failures), and Finder `Open With` (`ExternalOpenURLRouter`), compiling cleanly with zero warnings under `-strict-concurrency=complete`.
+- **Pipeline Speedups, Adaptive Workers & Vision Warm-Up:** `batch_scanner.py` uses strided paper scalar estimation (`_estimate_paper_scalars`), strip-only border detection in `multipoint_border_mask_clean`, a `900 px` pre-check in `flatten_document_surface` before running full-resolution morphology, `cv2.multiply` / OpenCV bitwise operations in `enhance_image_bgr` + `compensate_strokes_and_lines`, and adaptive `resolve_worker_count` (`--workers auto`, passed automatically for `Hybrid OpenCV` runs from `ScannerBridge.swift`); `PDFToolsService.warmUpVisionOCR()` pre-compiles Vision `.accurate` ANE graphs asynchronously on launch in `AppViewModel.init()`.
 
 ### 5.2 Research Directions *(Not Scheduled)*
 - Lightweight semantic segmentation for zero-contrast borderless surfaces, Thin-Plate Spline (TPS) spine mesh unwarping, Navier-Stokes specular glare inpainting, and severe two-sided bleed-through compensation below `_MAGIC_LUT` threshold `215`.

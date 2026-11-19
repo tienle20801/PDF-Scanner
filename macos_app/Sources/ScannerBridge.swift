@@ -1052,6 +1052,7 @@ final class ScannerBridge: @unchecked Sendable {
             args.append(contentsOf: ["--margin", String(format: "%.1f", settings.margin)])
             args.append(contentsOf: ["--jpeg-quality", String(settings.jpegQuality)])
             args.append(contentsOf: ["--min-confidence", String(format: "%.2f", settings.minConfidence)])
+            args.append(contentsOf: ["--workers", "auto"])
             args.append(contentsOf: ["--emit-dir", emitDir.path])
             args.append(contentsOf: ["--manifest", manifestURL.path])
             if !settings.autoCrop { args.append("--no-crop") }
